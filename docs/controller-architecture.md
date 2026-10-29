@@ -4116,6 +4116,53 @@ closes the lifecycle, reusing the merged-worktree-removal semantics of
 worktree, so teardown is a no-op and the shared-root path stays byte-for-byte
 unchanged.
 
+## `sdlc fix` worktrees (Story 35.5-011)
+
+`sdlc fix` used to run every stage in the operator's checkout. Its agents'
+opening `git checkout -b` switched the user's branch, its draft commits leaked
+into an unrelated docs MR, and its merge prompt's "return to main" pulled local
+`main` under the user (#799). An interrupted run also left the checkout on an
+empty `feature/issue-<N>`. The #590 dirty-tree guard existed only because of
+that shared checkout.
+
+Every **real** fix now works in its own worktree, at any concurrency. Unlike a
+build, there is no shared-root mode and no fallback:
+
+- **Single issue** — `run_fix` calls `_open_fix_worktree` right after the run
+  row opens and before preflight. That helper is `create_story_worktree` plus
+  `set_story_worktree`, giving `.claude/worktrees/agent-<run>-issue-<N>`,
+  detached at the base ref. The dispatch seam is bound to it with
+  `functools.partial(dispatch, cwd=workdir)`, so investigation, every stage, the
+  commit-lint amend, the bugfix loop and the summary all run there. The agent
+  cuts `feature/issue-<N>` inside the worktree.
+- **Batch** (`sdlc fix all` / `next`) — each issue gets its own worktree in
+  `_run_one`, including under `--sequential` / `--concurrency=1`. The batch no
+  longer runs `_reposition_head` on the checkout. The doc-update phase cuts its
+  branch in a worktree of its own (`agent-<run>-doc-update`), removed
+  afterwards. Batch investigation is read-only and still shares the repo root.
+- **No worktree, no fix.** A `WorktreeError` refuses the run with the reason: a
+  single fix is closed `ABORTED` before preflight, and a batch issue is
+  `FAILED`. A doc-update phase with no worktree is skipped. None of them falls
+  back to the checkout.
+- **Close-out.** A single fix's terminal exits (merged, failed,
+  `NEEDS_ATTENTION`, `AWAITING_APPROVAL`, a red preflight, a blocked
+  investigation) call `_teardown_story_workdir`, as a build story's close-out
+  does. The branch/PR is kept, and unpushed commits are pushed first
+  (Story 35.5-001). A `RATE_LIMITED` park keeps its worktree.
+- **Resume.** `resume_fix` re-attaches to the worktree recorded on the story
+  row. The path is deterministic, so a worktree that was torn down is re-cut in
+  the same place. If it cannot be created, the resume is refused and the run
+  stays as resumable as it was.
+- **Operator files (#685).** The snapshot and damage check still guard the
+  operator's checkout (`operator_root`), not the fix's worktree.
+- **Dirty checkouts.** A dirty checkout no longer refuses a fix. `--allow-dirty`
+  is still accepted so existing scripts and frozen queue argv parse, but it has
+  no effect. A fleet worker's own sync check (a tracked-dirty clone is
+  refused) is unchanged.
+
+Preflight still runs in the repo root, as `sdlc build`'s does. Fake-dispatcher
+(test) runs get no worktree.
+
 ## Per-run token budget gate (Story 14.1-001)
 
 `sdlc build --budget=<N>` sets a **token** ceiling the controller respects

@@ -195,8 +195,8 @@ def test_format_dirty_tree_truncates_a_long_list(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_run_fix_refuses_to_start_on_a_dirty_checkout(tmp_path) -> None:
-    """Issue #590: the run that would have let an agent stash FX's work never starts."""
+def test_run_fix_no_longer_refuses_a_dirty_checkout(tmp_path) -> None:
+    """Story 35.5-011: a fix works in its own worktree, so #590's guard is gone."""
     root = _init_repo(tmp_path)
     (root / "CLAUDE.md").write_text("hand-edited\n", encoding="utf-8")
     dispatch = RecordingDispatcher()
@@ -208,41 +208,16 @@ def test_run_fix_refuses_to_start_on_a_dirty_checkout(tmp_path) -> None:
         preflight=lambda: True,
         runner=FakeGh(_issue_json()),
         root=root,
-        dirty_check=lambda: dirty_tree_paths(root),
     )
 
-    assert result.status == "ABORTED"
-    assert result.dirty_tree == ["CLAUDE.md"]
-    # Nothing dispatched, so nothing could have stashed anything...
-    assert dispatch.agents() == []
-    # ...and no run row exists to be left half-open.
-    assert result.run_id is None
-    # The user's work is untouched and still visible to `git status`.
+    assert result.status == "DONE"
+    assert "build" in dispatch.agents()
+    # The user's work is untouched and nothing was stashed.
     assert (root / "CLAUDE.md").read_text(encoding="utf-8") == "hand-edited\n"
     assert list_stashes(root) == []
 
 
-def test_run_fix_uses_the_real_probe_on_a_real_run(tmp_path) -> None:
-    """The default seam — not just an injected one — refuses a dirty checkout."""
-    root = _init_repo(tmp_path)
-    (root / "CLAUDE.md").write_text("hand-edited\n", encoding="utf-8")
-
-    result = run_fix(
-        FixOptions(issue=1),
-        ledger=Ledger(tmp_path / ".sdlc-state.db"),
-        # dispatcher=None marks a real run; the guard returns before preflight
-        # and before the first dispatch, so no agent is ever launched.
-        preflight=lambda: True,
-        runner=FakeGh(_issue_json()),
-        root=root,
-        registry=Registry(tmp_path / "registry.json"),
-    )
-
-    assert result.status == "ABORTED"
-    assert result.dirty_tree == ["CLAUDE.md"]
-
-
-def test_run_fix_allow_dirty_opts_out(tmp_path) -> None:
+def test_run_fix_still_accepts_allow_dirty_as_a_no_op(tmp_path) -> None:
     root = _init_repo(tmp_path)
     (root / "CLAUDE.md").write_text("hand-edited\n", encoding="utf-8")
     dispatch = RecordingDispatcher()
@@ -254,52 +229,13 @@ def test_run_fix_allow_dirty_opts_out(tmp_path) -> None:
         preflight=lambda: True,
         runner=FakeGh(_issue_json()),
         root=root,
-        dirty_check=lambda: dirty_tree_paths(root),
     )
 
     assert result.status == "DONE"
-    assert result.dirty_tree == []
     assert "build" in dispatch.agents()
 
 
-def test_run_fix_starts_normally_on_a_clean_checkout(tmp_path) -> None:
-    root = _init_repo(tmp_path)
-    result = run_fix(
-        FixOptions(issue=1),
-        ledger=Ledger(tmp_path / ".sdlc-state.db"),
-        dispatcher=RecordingDispatcher(),
-        preflight=lambda: True,
-        runner=FakeGh(_issue_json()),
-        root=root,
-        dirty_check=lambda: dirty_tree_paths(root),
-    )
-    assert result.status == "DONE"
-
-
-def test_run_fix_does_not_probe_git_when_a_dispatcher_is_injected(
-    tmp_path, monkeypatch
-) -> None:
-    """A fake-dispatch run launches no agent, so it must not pay for (or trip on)
-    the probe — this is what keeps every existing orchestration test unchanged."""
-    import sdlc.fix_issue as fix_mod
-
-    def _explode(_root):  # pragma: no cover - must never be reached
-        raise AssertionError("the git probe must not run for an injected dispatcher")
-
-    monkeypatch.setattr(fix_mod, "dirty_tree_paths", _explode)
-    result = run_fix(
-        FixOptions(issue=1),
-        ledger=Ledger(tmp_path / ".sdlc-state.db"),
-        dispatcher=RecordingDispatcher(),
-        preflight=lambda: True,
-        runner=FakeGh(_issue_json()),
-        root=tmp_path,
-    )
-    assert result.status == "DONE"
-
-
-def test_run_fix_batch_refuses_to_start_on_a_dirty_checkout(tmp_path) -> None:
-    """Every issue in a batch shares one checkout, so one refusal covers them all."""
+def test_run_fix_batch_no_longer_refuses_a_dirty_checkout(tmp_path) -> None:
     root = _init_repo(tmp_path)
     (root / "CLAUDE.md").write_text("hand-edited\n", encoding="utf-8")
     dispatch = RecordingDispatcher()
@@ -311,13 +247,12 @@ def test_run_fix_batch_refuses_to_start_on_a_dirty_checkout(tmp_path) -> None:
         preflight=lambda: True,
         runner=FakeBatchGh([_batch_issue(1)]),
         root=root,
-        dirty_check=lambda: dirty_tree_paths(root),
     )
 
-    assert result.status == "ABORTED"
-    assert result.dirty_tree == ["CLAUDE.md"]
-    assert result.run_id is None
-    assert dispatch.agents() == []
+    assert result.status == "DONE"
+    assert result.run_id is not None
+    assert "build" in dispatch.agents()
+    assert list_stashes(root) == []
 
 
 def test_run_build_refuses_to_start_on_a_dirty_checkout(tmp_path) -> None:
@@ -382,33 +317,6 @@ def test_run_build_binds_the_real_probe_on_a_real_run(tmp_path, monkeypatch) -> 
         ledger=Ledger(tmp_path / ".sdlc-state.db"),
         preflight=lambda: True,  # also disarms the recursion guard
         root=root,
-    )
-
-    assert seen == [root]
-    assert result.dirty_tree == ["CLAUDE.md"]
-    assert result.run_id is None
-
-
-def test_run_fix_batch_binds_the_real_probe_on_a_real_run(tmp_path, monkeypatch) -> None:
-    """Same default binding for the batch path, asserted the same safe way."""
-    import sdlc.fix_issue as fix_mod
-
-    seen: list[Path] = []
-
-    def _spy(root: Path) -> list[str]:
-        seen.append(root)
-        return ["CLAUDE.md"]
-
-    monkeypatch.setattr(fix_mod, "dirty_tree_paths", _spy)
-    root = _init_repo(tmp_path)
-
-    result = run_fix_batch(
-        FixBatchOptions(target="all"),
-        ledger=Ledger(tmp_path / ".sdlc-state.db"),
-        preflight=lambda: True,
-        runner=FakeBatchGh([_batch_issue(1)]),
-        root=root,
-        registry=Registry(tmp_path / "registry.json"),
     )
 
     assert seen == [root]

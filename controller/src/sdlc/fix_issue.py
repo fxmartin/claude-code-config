@@ -57,18 +57,17 @@ from sdlc.build import (
     render_merge_drift_block,
     _registry_finish,
     _registry_register,
-    _reposition_head,
     _run_merge_ci_gate,
     _stage_succeeded,
     _sync_branch_to_remote,
     _StoryDispatch,
     _StoryRunOutcome,
+    _teardown_story_workdir,
     close_superseded_runs,
     create_story_worktree,
     default_preflight,
     preflight_command_text,
     run_preflight_phase,
-    dirty_tree_paths,
     finalize_run,
     operator_files_damage,
     operator_files_snapshot,
@@ -184,10 +183,9 @@ class FixOptions:
     skip_coverage: bool = False
     coverage_threshold: int = 90
     skip_preflight: bool = False
-    # Issue #590: opt out of the dirty-shared-checkout guard. Default False =
-    # refuse to start when the repo root carries uncommitted tracked changes,
-    # because the build agent, hit by the resulting failed `git checkout -b`, has
-    # been seen stashing them itself — a stash a crashed run then strands.
+    # Issue #590's `--allow-dirty`, kept so existing scripts and frozen queue
+    # argv still parse. A no-op since Story 35.5-011: a fix works in its own
+    # worktree, so a dirty checkout is no longer a reason to refuse.
     allow_dirty: bool = False
     # Issue #654: opt out of the undenied-host-auth guard — mirrors
     # :class:`sdlc.build.BuildOptions`. Default False = refuse to start when a
@@ -240,8 +238,7 @@ class FixBatchOptions:
     skip_coverage: bool = False
     coverage_threshold: int = 90
     skip_preflight: bool = False
-    # Issue #590: mirrors :class:`FixOptions` — the batch shares one checkout, so
-    # the guard is checked once for the whole batch and threaded down per issue.
+    # Mirrors :class:`FixOptions` — accepted, no effect (Story 35.5-011).
     allow_dirty: bool = False
     # Issue #654: mirrors :class:`FixOptions` — the batch shares one role->harness
     # map, so the guard is checked once for the whole batch and the decision is
@@ -290,10 +287,6 @@ class FixBatchResult:
     status: str = ""
     outcomes: list[FixIssueOutcome] = field(default_factory=list)
     preflight_failed: bool = False
-    # Issue #590: tracked paths with uncommitted changes that made the batch
-    # refuse to start on the shared checkout. Non-empty means nothing was
-    # dispatched and no run row exists.
-    dirty_tree: list[str] = field(default_factory=list)
     # Issue #654: ``(role, harness)`` pairs that made the batch refuse to start —
     # a host-auth role routed to a harness with no deny baseline. Non-empty means
     # nothing was dispatched and no run row exists.
@@ -330,10 +323,6 @@ class FixResult:
     aborted: bool = False
     abort_reason: str = ""
     preflight_failed: bool = False
-    # Issue #590: tracked paths with uncommitted changes that made the run refuse
-    # to start on the shared checkout. Non-empty means nothing was dispatched and
-    # no run row exists — the user's work is still exactly where they left it.
-    dirty_tree: list[str] = field(default_factory=list)
     # Issue #654: ``(role, harness)`` pairs — host-auth roles routed to a harness
     # that renders no deny baseline — that made the run refuse to start. Non-empty
     # means nothing was dispatched and no run row exists.
@@ -843,7 +832,11 @@ def render_merge_prompt(
         f"2. Merge with: {_cr_cli(cr_terms, 'merge')}.\n"
         f"3. Close the issue: {close_cmd} {issue.number}{reason_flag} "
         f'(and comment "Fixed in {abbr} #{pr_number}.").\n'
-        "4. Return to main: git checkout main && git pull.\n"
+        # Story 35.5-011: the merge runs in the fix's own worktree, which the
+        # controller tears down. Switching it to `main` (and pulling) is how a
+        # fix moved the operator's local main under them (#799).
+        "4. Stay on this branch afterwards — do not check out or pull `main`; "
+        "the controller removes this worktree.\n"
         f'The {abbr} body already carries "Closes #{issue.number}"; closing the '
         "issue explicitly is a safety net.\n"
         f"If the {abbr} is blocked only by the high-risk approval gate (it carries "
@@ -936,7 +929,7 @@ def render_e2e_prompt(issue: FixIssue, pr_number: int | None) -> str:
         "was already flaky/outdated (repair the test), or the failure is "
         "pre-existing and unrelated (note it and continue), then re-run until "
         "green or a reasonable attempt cap is reached.\n"
-        "4. Return to main when done.\n"
+        "4. Stay on the PR branch when done — do not check out `main`.\n"
         "Report e2e_result PASS when the existing suite is green, FAIL when it is "
         "still red, or SKIP when no E2E harness applies, plus a one-line "
         "e2e_summary.\n\n"
@@ -1718,6 +1711,7 @@ def _run_stage_loop(
     bugfix_seq: int = 0,
     start_attempts: dict[str, int] | None = None,
     protected_files: dict[str, str | None] | None = None,
+    operator_root: Path | None = None,
 ) -> tuple[str, int | None]:
     """Drive build → coverage → review → merge with the bounded bugfix loop.
 
@@ -1743,10 +1737,13 @@ def _run_stage_loop(
     best baseline a resume has). After every stage and bugfix dispatch, a deleted
     or rewritten snapshotted file, or an agent's self-reported destructive action,
     parks the run ``NEEDS_ATTENTION`` whatever the stage's structured verdict said.
+    Story 35.5-011: ``operator_root`` is the operator's checkout those files live
+    in when ``root`` is the fix's own worktree; ``None`` means ``root`` is it.
     """
     checkout = root or Path.cwd()
+    operator_checkout = operator_root or checkout
     if protected_files is None:
-        protected_files = operator_files_snapshot(checkout)
+        protected_files = operator_files_snapshot(operator_checkout)
     cr_terms = issue_host.get_adapter(host, instance_url=instance_url).cr_terms
     stages = [s for s in FIX_CORE_STAGES if not (s == "coverage" and opts.skip_coverage)]
     # Issue #547: a resume re-enters here with the stages that already completed,
@@ -1877,7 +1874,7 @@ def _run_stage_loop(
                 return "RATE_LIMITED", pr_number
 
             violation = _stage_safety_violation(
-                stage, result, tpath, checkout, protected_files
+                stage, result, tpath, operator_checkout, protected_files
             )
             if violation:
                 ledger.stage_finish(
@@ -1974,7 +1971,7 @@ def _run_stage_loop(
                 issue, inv, story, stage, failure, opts, ledger, run_id, dispatch, bpath, bugfix_seq
             )
             violation = _stage_safety_violation(
-                "bugfix", None, bpath, checkout, protected_files
+                "bugfix", None, bpath, operator_checkout, protected_files
             )
             if violation:
                 _log_safety_park(ledger, run_id, story.id, violation)
@@ -2218,7 +2215,6 @@ def run_fix(
     root: Path | None = None,
     logs_dir: Path | None = None,
     registry: Registry | None = None,
-    dirty_check: Callable[[], list[str]] | None = None,
 ) -> FixResult:
     """Run the single-issue fix orchestration deterministically (issue #436).
 
@@ -2242,21 +2238,17 @@ def run_fix(
     resolved like :func:`run_resume`'s — a real one only on a real run, so the
     injected-fake orchestration tests never touch host state.
 
-    Issue #590: ``dirty_check`` is the shared-checkout guard's seam — it returns
-    the tracked paths with uncommitted changes, and a non-empty result refuses the
-    run before anything is dispatched. It defaults to the real git probe only on a
-    *real* run; a run given an injected dispatcher launches no agent, so there is
-    no shared checkout for one to stash behind the controller's back.
+    Story 35.5-011: a real run (``dispatcher is None``) works in its own worktree,
+    ``.claude/worktrees/agent-<run>-issue-<N>``, cut before preflight and torn
+    down at close-out — the checkout's branch, index and status are never moved,
+    so a dirty checkout is no reason to refuse. A worktree that cannot be created
+    refuses the run (closed ABORTED with the reason); it never falls back to the
+    checkout. An injected dispatcher launches no agent, so it gets no worktree.
     """
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
     if registry is None and dispatcher is None:
         registry = Registry()
-    check_dirty = dirty_check or (
-        (lambda: dirty_tree_paths(root or Path.cwd()))
-        if dispatcher is None
-        else (lambda: [])
-    )
 
     # Issue #606 / Story 30.1-001: resolve the code host (and any declared
     # self-hosted instance) once — --host wins, else the repo's
@@ -2284,18 +2276,6 @@ def run_fix(
         return FixResult(
             issue=opts.issue, aborted=True, abort_reason=stop, status="ABORTED"
         )
-
-    # --- Dirty shared-checkout guard (issue #590) -----------------------------
-    # A fix run never cuts a worktree: every stage runs against the repo root. If
-    # that root is dirty the agent's opening `git checkout -b` fails with git's
-    # "commit your changes or stash them" hint, and agents have taken it — an
-    # untracked stash a crashed run then strands while `git status` reads clean.
-    # Refuse here, before preflight burns a test run and before any dispatch, so
-    # the user's work is still exactly where they left it. `--allow-dirty` opts out.
-    if not opts.allow_dirty:
-        dirty = check_dirty()
-        if dirty:
-            return FixResult(issue=opts.issue, dirty_tree=dirty, status="ABORTED")
 
     # --- Undenied host-auth routing guard (issue #654) ------------------------
     # A registry harness renders its own command template and so never receives
@@ -2369,6 +2349,20 @@ def run_fix(
     # issue whose gate never passed (died in it, or came back red), which a bare
     # `sdlc resume` would otherwise re-fix or keep naming.
     close_superseded_runs(ledger, run_id, scope, registry)
+    # Story 35.5-011: the fix's own worktree, before preflight burns a test run.
+    workdir: Path | None = None
+    if dispatcher is None:
+        try:
+            workdir = _open_fix_worktree(ledger, run_id, story.id)
+        except WorktreeError as exc:
+            reason = _worktree_refusal(exc)
+            ledger.event_log(run_id, story.id, "error", "controller", reason)
+            _close_early(ledger, run_id, "ABORTED", render_view, registry, subject=story.title)
+            return FixResult(
+                issue=opts.issue, run_id=run_id, aborted=True, abort_reason=reason,
+                status="ABORTED",
+            )
+        dispatch = functools.partial(dispatch, cwd=workdir)
     try:
         notify(
             "run_started", run=run_id, scope=scope, mode="fix",
@@ -2393,6 +2387,8 @@ def run_fix(
             registry=registry, repo=(root or Path.cwd()).name,
             subject=story.title, render_view=render_view,
         ) is not None:
+            if workdir is not None:
+                _teardown_story_workdir(ledger, run_id, story.id, real_run=True)
             return FixResult(
                 issue=opts.issue, run_id=run_id, preflight_failed=True, status="FAILED"
             )
@@ -2400,7 +2396,37 @@ def run_fix(
     return _investigate_and_finish_fix(
         issue, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
         host=host, instance_url=instance_url, render_view=render_view,
-        registry=registry,
+        registry=registry, workdir=workdir,
+    )
+
+
+def _open_fix_worktree(ledger: Ledger, run_id: str, story_id: str) -> Path:
+    """Cut (or re-attach) one fix's own worktree and record it (Story 35.5-011).
+
+    A fix used to run every stage in the operator's checkout: its agents' opening
+    ``git checkout -b`` switched the user's branch, its draft commits leaked into
+    unrelated branches (#799), and an interrupted run left the checkout on an
+    empty ``feature/issue-<N>``. Every real fix now works in
+    ``.claude/worktrees/agent-<run>-issue-<N>`` as a parallel ``sdlc build``
+    story does. The path is deterministic and recorded on the story row, which is
+    what lets ``sdlc resume`` re-attach to it. Raises :class:`WorktreeError`; the
+    caller refuses rather than falling back to the checkout.
+    """
+    recorded = ledger.story_worktree(run_id, story_id)
+    path = create_story_worktree(Path.cwd(), story_id, run_id)
+    ledger.set_story_worktree(run_id, story_id, str(path))
+    verb = "re-attached" if recorded == str(path) else "ready"
+    ledger.event_log(
+        run_id, story_id, "info", "controller", f"isolated fix worktree {verb} at {path}"
+    )
+    return path
+
+
+def _worktree_refusal(exc: WorktreeError) -> str:
+    """Why a fix refused to run: its worktree could not be created (Story 35.5-011)."""
+    return (
+        f"could not create the fix's worktree ({exc}); refusing rather than "
+        "working in the checkout"
     )
 
 
@@ -2418,12 +2444,17 @@ def _investigate_and_finish_fix(
     instance_url: str | None,
     render_view=None,
     registry: Registry | None = None,
+    workdir: Path | None = None,
 ) -> FixResult:
     """Everything after preflight: investigate, run the stage loop, close out.
 
     Shared by :func:`run_fix` and a :func:`resume_fix` of a run that was
     interrupted *in* preflight (Story 35.4-005) — nothing was dispatched, so it
     re-runs the gate and then carries on exactly as a fresh fix does.
+
+    ``workdir`` is the fix's own worktree (Story 35.5-011), ``None`` for an
+    injected-dispatcher run: the stages run there and it is torn down on every
+    terminal exit; the operator's checkout (``root``) is only guarded.
     """
     # Issue #685: snapshot the operator's dirty/untracked files before the first
     # agent runs, so the stage loop can prove `--allow-dirty` kept its promise.
@@ -2439,6 +2470,8 @@ def _investigate_and_finish_fix(
         ledger.event_log(
             run_id, story.id, "warn", "controller", f"investigation blocked: {reason}"
         )
+        if workdir is not None:
+            _teardown_story_workdir(ledger, run_id, story.id, real_run=True)
         _close_early(ledger, run_id, "ABORTED", render_view, registry, subject=story.title)
         return FixResult(
             issue=opts.issue, run_id=run_id, status="ABORTED",
@@ -2446,6 +2479,8 @@ def _investigate_and_finish_fix(
         )
     if inv_status == "FAILED":
         ledger.set_story_status(run_id, story.id, "FAILED")
+        if workdir is not None:
+            _teardown_story_workdir(ledger, run_id, story.id, real_run=True)
         _close_early(ledger, run_id, "FAILED", render_view, registry, subject=story.title)
         return FixResult(issue=opts.issue, run_id=run_id, status="FAILED")
 
@@ -2461,7 +2496,8 @@ def _investigate_and_finish_fix(
     # --- Core stage loop ------------------------------------------------------
     main_baseline = _commits_ahead_of_origin(Path.cwd())
     terminal, pr_number = _run_stage_loop(
-        issue, inv, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
+        issue, inv, story, opts, ledger, run_id, dispatch, logs_dir,
+        root=workdir or root, operator_root=root or Path.cwd(),
         host=host, instance_url=instance_url, protected_files=protected_files,
     )
 
@@ -2469,6 +2505,7 @@ def _investigate_and_finish_fix(
         issue, inv, story, opts, ledger, run_id, dispatch, logs_dir,
         terminal=terminal, pr_number=pr_number,
         render_view=render_view, registry=registry, main_baseline=main_baseline,
+        workdir=workdir,
     )
 
 
@@ -2487,6 +2524,7 @@ def _finish_fix_run(
     render_view=None,
     registry: Registry | None = None,
     main_baseline: Sequence[str] = (),
+    workdir: Path | None = None,
 ) -> FixResult:
     """Summary, rate-limit park, and close-out for a finished stage loop.
 
@@ -2516,6 +2554,10 @@ def _finish_fix_run(
     # dashboard see the finished story, then close the run out.
     terminal = _guard_main_not_ahead(ledger, run_id, terminal, main_baseline)
     ledger.set_story_status(run_id, story.id, terminal)
+    # Story 35.5-011: a closed fix tears its worktree down as a build story does
+    # (branch/PR kept). The rate-limit park returned above keeps it for resume.
+    if workdir is not None:
+        _teardown_story_workdir(ledger, run_id, story.id, real_run=True)
 
     # --- Close out via the shared finalize (counts, terminal, run_finished) ---
     outcome = finalize_run(
@@ -2659,6 +2701,22 @@ def resume_fix(
     )
     pr_number = story_row.get("pr_number")
 
+    # Story 35.5-011: continue in the fix's own worktree — re-attached at the
+    # path the ledger recorded, or re-cut there if it was already torn down. A
+    # refusal leaves the run exactly as resumable as it was.
+    workdir: Path | None = None
+    if dispatcher is None:
+        try:
+            workdir = _open_fix_worktree(ledger, run_id, story.id)
+        except WorktreeError as exc:
+            reason = _worktree_refusal(exc)
+            ledger.event_log(run_id, story.id, "error", "controller", f"resume refused: {reason}")
+            return FixResult(
+                issue=issue_number, run_id=run_id, aborted=True, status="ABORTED",
+                abort_reason=reason,
+            )
+        dispatch = functools.partial(dispatch, cwd=workdir)
+
     ledger.run_update_status(run_id, "IN_PROGRESS")
     teardown.bind_run(ledger, run_id, registry)
     ledger.event_log(
@@ -2681,18 +2739,21 @@ def resume_fix(
             registry=registry, repo=(root or Path.cwd()).name,
             subject=story.title, render_view=render_view,
         ) is not None:
+            if workdir is not None:
+                _teardown_story_workdir(ledger, run_id, story.id, real_run=True)
             return FixResult(
                 issue=issue_number, run_id=run_id, preflight_failed=True, status="FAILED"
             )
         return _investigate_and_finish_fix(
             issue, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
             host=host, instance_url=instance_url, render_view=render_view,
-            registry=registry,
+            registry=registry, workdir=workdir,
         )
 
     main_baseline = _commits_ahead_of_origin(Path.cwd())
     terminal, pr_number = _run_stage_loop(
-        issue, plan, story, opts, ledger, run_id, dispatch, logs_dir, root=root,
+        issue, plan, story, opts, ledger, run_id, dispatch, logs_dir,
+        root=workdir or root, operator_root=root or Path.cwd(),
         host=host, instance_url=instance_url, done_stages=done_stages,
         pr_number=pr_number, bugfix_seq=bugfix_seq, start_attempts=start_attempts,
     )
@@ -2700,6 +2761,7 @@ def resume_fix(
         issue, plan, story, opts, ledger, run_id, dispatch, logs_dir,
         terminal=terminal, pr_number=pr_number,
         render_view=render_view, registry=registry, main_baseline=main_baseline,
+        workdir=workdir,
     )
 
 
@@ -3056,10 +3118,6 @@ def _issue_options(batch: FixBatchOptions, number: int) -> FixOptions:
         skip_coverage=batch.skip_coverage,
         coverage_threshold=batch.coverage_threshold,
         skip_preflight=batch.skip_preflight,
-        # Issue #590: the batch already ran the guard once for the shared
-        # checkout; a per-issue re-check would trip on the batch's own in-flight
-        # edits, so the decision is inherited rather than repeated.
-        allow_dirty=True,
         # Issue #654: same inheritance — the batch already refused (or was
         # explicitly bypassed) once for the shared role->harness map.
         allow_undenied=True,
@@ -3243,7 +3301,6 @@ def run_fix_batch(
     root: Path | None = None,
     logs_dir: Path | None = None,
     registry: Registry | None = None,
-    dirty_check: Callable[[], list[str]] | None = None,
 ) -> FixBatchResult:
     """Run the batch fix orchestration deterministically (issue #436, PR2).
 
@@ -3257,7 +3314,11 @@ def run_fix_batch(
 
     ``dispatcher`` defaults to the real subprocess-backed dispatch; a fake is
     injected in tests (and, as in ``run_build``, ``dispatcher is None`` marks a
-    real run that may cut per-issue worktrees). ``runner`` is the ``gh`` seam.
+    real run). ``runner`` is the ``gh`` seam.
+
+    Story 35.5-011: a real run builds every issue in its own worktree, at any
+    concurrency — never in the checkout, which is neither dirty-checked nor
+    repositioned. An issue whose worktree cannot be created fails with the reason.
 
     ``registry`` mirrors :func:`run_fix` — a batch opens its own run row, so it
     carries the same Issue #545 registration and would otherwise be just as
@@ -3276,24 +3337,8 @@ def run_fix_batch(
     resolution = _resolve_fix_forge(root, batch.host)
     host, instance_url = resolution.host, resolution.instance_url
 
-    # --- Dirty shared-checkout guard (issue #590) -----------------------------
-    # Every issue in the batch runs against the same repo root, so one check for
-    # the whole batch — before selection, preflight, or any dispatch — protects
-    # all of them from an agent stashing the user's uncommitted work to unblock
-    # its own `git checkout -b`. See :func:`run_fix` for the full rationale.
-    check_dirty = dirty_check or (
-        (lambda: dirty_tree_paths(root or Path.cwd())) if real_run else (lambda: [])
-    )
     if sandbox_enabled():
         return FixBatchResult(status="ABORTED", summary=SANDBOX_UNSUPPORTED_REASON)
-    if not batch.allow_dirty:
-        dirty = check_dirty()
-        if dirty:
-            return FixBatchResult(
-                dirty_tree=dirty,
-                status="ABORTED",
-                summary="refused to start: uncommitted changes in the working tree",
-            )
 
     # --- Undenied host-auth routing guard (issue #654) ------------------------
     # Every issue in the batch shares one role->harness map, so one check for the
@@ -3426,22 +3471,24 @@ def run_fix_batch(
         opts = _issue_options(batch, entry.issue.number)
         issue_dispatch = dispatch
         workdir: Path | None = None
-        # Isolate a real concurrent issue in its own worktree so peers never
-        # collide in the shared checkout (mirrors run_build's _prepare_story_workdir).
-        if real_run and workers > 1:
+        # Story 35.5-011: every real issue gets its own worktree, at any
+        # concurrency — no fallback to the checkout when one cannot be created.
+        if real_run:
             try:
-                workdir = create_story_worktree(Path.cwd(), story.id, run_id)
-                worktrees[story.id] = workdir
-                ledger.set_story_worktree(run_id, story.id, str(workdir))
-                issue_dispatch = functools.partial(dispatch, cwd=workdir)
+                workdir = _open_fix_worktree(ledger, run_id, story.id)
             except WorktreeError as exc:
-                ledger.event_log(
-                    run_id, story.id, "warn", "controller",
-                    f"worktree isolation unavailable ({exc}); building in the repo root",
+                reason = _worktree_refusal(exc)
+                ledger.event_log(run_id, story.id, "error", "controller", reason)
+                outcomes[story.id] = FixIssueOutcome(
+                    entry.issue.number, "FAILED", drop_reason=reason
                 )
+                return _StoryRunOutcome(status="FAILED")
+            worktrees[story.id] = workdir
+            issue_dispatch = functools.partial(dispatch, cwd=workdir)
         terminal, pr_number = _run_stage_loop(
             entry.issue, entry.inv, story, opts, ledger, run_id, issue_dispatch, logs_dir,
-            root=workdir or Path.cwd(), host=host, instance_url=instance_url,
+            root=workdir or Path.cwd(), operator_root=Path.cwd(),
+            host=host, instance_url=instance_url,
         )
         if terminal == "DONE":
             _run_summary(
@@ -3516,8 +3563,6 @@ def run_fix_batch(
             before_batch=_refresh_base,
             on_result=_apply,
         )
-        if real_run:
-            _reposition_head(Path.cwd())
 
     ordered = [outcomes[sid] for sid in sorted(outcomes, key=lambda s: int(s.split("-")[1]))]
     summary = _batch_summary(ordered)
@@ -3558,7 +3603,7 @@ def run_fix_batch(
     # a failure is logged and never changes the batch's terminal (skill Phase 10b).
     _run_doc_update(
         ordered, scope, batch, ledger, run_id, dispatch, logs_dir,
-        host=host, instance_url=instance_url,
+        host=host, instance_url=instance_url, isolate=real_run,
     )
 
     # Report-only: the fixes already merged, so flipping them to FAILED would
@@ -3596,6 +3641,7 @@ def _run_doc_update(
     *,
     host: str = issue_host.GITHUB,
     instance_url: str | None = None,
+    isolate: bool = False,
 ) -> None:
     """Best-effort batch doc-update phase — reviews merged fixes on a fresh PR.
 
@@ -3612,10 +3658,48 @@ def _run_doc_update(
     anchor row is upserted first; its ``PHASE`` status is deliberately outside the
     story-status vocabulary ``status_snapshot`` counts, so a batch-level phase can
     never inflate the run's done/failed tallies (see `_BATCH_PHASE_STATUS`).
+
+    Story 35.5-011: with ``isolate`` (a real run) the agent works in its own
+    worktree, removed afterwards (its branch kept) — never in the checkout. With
+    no worktree the phase is skipped, as advisory work is on any other failure.
     """
     merged = [o for o in outcomes if o.status == "DONE"]
     if not merged:
         return
+    workdir: Path | None = None
+    if isolate:
+        try:
+            workdir = create_story_worktree(Path.cwd(), "doc-update", run_id)
+        except WorktreeError as exc:
+            ledger.event_log(
+                run_id, "", "warn", "controller",
+                f"doc-update phase skipped: {_worktree_refusal(exc)}",
+            )
+            return
+        dispatch = functools.partial(dispatch, cwd=workdir)
+    try:
+        _dispatch_doc_update(
+            merged, scope, batch, ledger, run_id, dispatch, logs_dir,
+            host=host, instance_url=instance_url,
+        )
+    finally:
+        if workdir is not None:
+            remove_story_worktree(Path.cwd(), workdir)
+
+
+def _dispatch_doc_update(
+    merged: list[FixIssueOutcome],
+    scope: str,
+    batch: FixBatchOptions,
+    ledger: Ledger,
+    run_id: str,
+    dispatch,
+    logs_dir: Path,
+    *,
+    host: str,
+    instance_url: str | None,
+) -> None:
+    """Dispatch the doc-update agent for ``merged`` and meter it; never raises."""
     model = resolve_model_id(
         batch.model_overrides.get("doc_update") or FIX_STAGE_MODELS.get("doc_update")
     )
@@ -3629,8 +3713,8 @@ def _run_doc_update(
         ledger.stage_start(run_id, "", "doc-update", 1, model=model)
         cr_terms = issue_host.get_adapter(host, instance_url=instance_url).cr_terms
         prompt = render_doc_update_prompt(scope, merged, cr_terms=cr_terms)
-        # No per-issue story: doc-update runs in the shared checkout and cuts its
-        # own branch, so ``story`` is left None (dispatch_agent ignores it).
+        # No per-issue story: doc-update cuts its own branch, so ``story`` is
+        # left None (dispatch_agent ignores it).
         result = dispatch(
             "doc_update", prompt, story=None, model=model,
             transcript_path=tpath, on_progress=None,
@@ -3683,7 +3767,7 @@ def _batch_summary(outcomes: list[FixIssueOutcome]) -> str:
 _FIX_BOOL_FLAGS = {
     "--skip-coverage": "skip_coverage",
     "--skip-preflight": "skip_preflight",
-    # Issue #590: start anyway on a dirty shared checkout (opt-out of the guard).
+    # Issue #590: accepted for compatibility; a no-op since Story 35.5-011.
     "--allow-dirty": "allow_dirty",
     # Issue #654: start anyway with a host-auth role on an undenied harness.
     "--allow-undenied": "allow_undenied",
@@ -3703,7 +3787,8 @@ def parse_fix_args(args: Iterable[str]) -> FixOptions | FixBatchOptions:
     unchanged). A batch target — ``all`` (every open issue) or ``next`` (top open
     bugs, default one) — yields a :class:`FixBatchOptions`. Shared flags:
     ``--skip-coverage``, ``--coverage-threshold=N``, ``--skip-preflight``,
-    ``--allow-dirty`` (issue #590: start despite uncommitted changes),
+    ``--allow-dirty`` (issue #590; a no-op since Story 35.5-011 — a fix never
+    uses the checkout),
     ``--allow-undenied`` (issue #654: start despite a host-auth role routed to a
     harness with no deny baseline),
     ``--e2e-gate=warn|off`` (default off), its ``--skip-e2e`` alias, and
