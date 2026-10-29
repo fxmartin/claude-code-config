@@ -701,6 +701,36 @@ def default_worker_unit() -> Path:
     return Path(config) / "systemd" / "user" / WORKER_UNIT
 
 
+# Story 35.2-009: the Linux worker's dashboard, a sibling unit beside the worker's.
+DASHBOARD_UNIT = "sdlc-dashboard.service"
+
+
+def default_dashboard_unit() -> Path:
+    """Where `systemctl --user` loads the worker's dashboard unit from."""
+    return default_worker_unit().with_name(DASHBOARD_UNIT)
+
+
+def _unit_exec_start(path: Path) -> list[str]:
+    """The unit's ``ExecStart`` argv, as systemd would run it (Story 35.2-010).
+
+    The unit's ``*.conf`` drop-ins follow it in name order, a later ``ExecStart=``
+    replacing an earlier one and an empty one clearing it. Specifiers (``%h``)
+    stay unexpanded: the templates carry them too. Raises ``OSError`` /
+    ``ValueError`` for a unit that cannot be read or split.
+    """
+    command = ""
+    drop_ins = sorted(path.with_name(f"{path.name}.d").glob("*.conf"))
+    for source in (path, *drop_ins):
+        in_service = False
+        for raw in source.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if line.startswith("["):
+                in_service = line == "[Service]"
+            elif in_service and line.partition("=")[0].strip() == "ExecStart":
+                command = line.partition("=")[2].strip()
+    return shlex.split(command)
+
+
 def _unit_value(value: str, home: Path) -> str:
     """Expand the two specifiers the template uses: ``%h`` (home) and ``%%``."""
     return value.replace("%%", "\0").replace("%h", str(home)).replace("\0", "%")
@@ -913,37 +943,50 @@ def _dashboard_probe(origin: str) -> str | None:
 def check_worker_dashboard(
     *,
     agent_path: Path | None = None,
+    unit_path: Path | None = None,
     probe: Callable[[str], str | None] | None = None,
 ) -> Finding | None:
     """Does the dashboard this worker advertises answer? (Story 35.4-006)
 
-    ``None`` on a machine that never installed the worker LaunchAgent, and when
-    its plist cannot be read (:func:`check_fleet_worker_installed` reports that).
-    The XPS shows a remote run's stories, events and cost by relaying this
-    dashboard, so a worker that advertises none — or one that does not answer —
-    leaves every run it owns header-only there.
+    ``None`` on a machine that installed neither the worker LaunchAgent nor —
+    Story 35.2-010 — the Linux worker unit, and when the installed one cannot be
+    read (:func:`check_fleet_worker_installed` reports that). The XPS shows a
+    remote run's stories, events and cost by relaying this dashboard, so a worker
+    that advertises none — or one that does not answer — leaves every run it owns
+    header-only there. Both paths default to the installed ones only when neither
+    is given.
 
-    Only the plist's ``--dashboard-url`` counts: it is all `queue run` reads.
-    ``SDLC_DASHBOARD_URL`` in the agent's environment is a bare build's input,
-    which the worker ignores — its pushes would still blank the run's URL, so
-    counting it would report CLEAN for a dashboard the XPS is never told of.
+    Only the plist's (or unit's ``ExecStart``) ``--dashboard-url`` counts: it is
+    all `queue run` reads. ``SDLC_DASHBOARD_URL`` in the agent's environment is a
+    bare build's input, which the worker ignores — its pushes would still blank
+    the run's URL, so counting it would report CLEAN for a dashboard the XPS is
+    never told of.
     """
     from sdlc.registry import normalize_dashboard_url
 
-    path = agent_path or default_worker_plist()
-    if not path.exists():
-        return None
+    if agent_path is None and unit_path is None:
+        agent_path, unit_path = default_worker_plist(), default_worker_unit()
+    name = "Worker dashboard"
     try:
-        plist = plistlib.loads(path.read_bytes())
-        args = [str(a) for a in plist.get("ProgramArguments") or []]
+        if agent_path is not None and agent_path.exists():
+            plist = plistlib.loads(agent_path.read_bytes())
+            args = [str(a) for a in plist.get("ProgramArguments") or []]
+            remedy = (
+                "re-run scripts/fleet-bootstrap.sh from the config repo: it renders both agents from "
+                "templates/launchd/, the worker advertising the dashboard with --dashboard-url "
+                f"(`launchctl print gui/$(id -u)/{DASHBOARD_LABEL}` shows the dashboard)"
+            )
+        elif unit_path is not None and unit_path.exists():
+            args = _unit_exec_start(unit_path)
+            remedy = (
+                "re-run scripts/fleet-bootstrap.sh from the config repo: it renders both units from "
+                "templates/systemd/, the worker advertising the dashboard with --dashboard-url "
+                "(`systemctl --user status sdlc-dashboard` shows the dashboard)"
+            )
+        else:
+            return None
     except Exception:  # noqa: BLE001 - see check_fleet_worker_installed
         return None
-    name = "Worker dashboard"
-    remedy = (
-        "re-run scripts/fleet-bootstrap.sh from the config repo: it renders both agents from "
-        "templates/launchd/, the worker advertising the dashboard with --dashboard-url "
-        f"(`launchctl print gui/$(id -u)/{DASHBOARD_LABEL}` shows the dashboard)"
-    )
     advertised = _plist_option(args, "--dashboard-url")
     if not advertised:
         return Finding(
@@ -969,6 +1012,9 @@ def check_worker_dashboard(
 # 35.4-006 added `--dashboard-url` to the worker template, merged, and no Mac ever
 # re-rendered the agent — so every remote run read "detail unavailable".
 _FLEET_AGENT_LABELS = (WORKER_LABEL, DASHBOARD_LABEL, QUEUE_SERVICE_LABEL)
+# Story 35.2-010: the Linux twins, compared by their ExecStart. Always worker `dev` on
+# the shared pools, so nothing in them is the host's to choose.
+_FLEET_UNITS = (WORKER_UNIT, DASHBOARD_UNIT)
 _TAILNET_IP = "__TAILNET_IP__"
 # `tailscale ip -4` is always in the CGNAT block 100.64.0.0/10 — never 0.0.0.0 or a LAN address.
 _TAILNET_IPV4 = r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}"
@@ -1032,6 +1078,7 @@ def check_fleet_agent_drift(
     repo_root: Path,
     *,
     agents: dict[str, Path] | None = None,
+    units: dict[str, Path] | None = None,
     home: Path | None = None,
 ) -> Finding | None:
     """Do the installed fleet LaunchAgents still match their templates? (Story 35.2-009)
@@ -1046,13 +1093,20 @@ def check_fleet_agent_drift(
     or neither checkout carries templates; an agent whose plist cannot be read is
     left to the checks that report it. A WARN names each drifting agent and its
     missing or unexpected arguments, and the bootstrap run that re-renders them.
+
+    The Linux worker's systemd units (Story 35.2-010) are compared the same way,
+    by ``ExecStart`` against ``templates/systemd/<unit>``. ``agents`` and
+    ``units`` default to the installed paths only when neither is given.
     """
     home = home or Path.home()
-    agents = agents or {
-        WORKER_LABEL: default_worker_plist(),
-        DASHBOARD_LABEL: default_dashboard_plist(),
-        QUEUE_SERVICE_LABEL: default_queue_service_plist(),
-    }
+    if agents is None and units is None:
+        agents = {
+            WORKER_LABEL: default_worker_plist(),
+            DASHBOARD_LABEL: default_dashboard_plist(),
+            QUEUE_SERVICE_LABEL: default_queue_service_plist(),
+        }
+        units = {WORKER_UNIT: default_worker_unit(), DASHBOARD_UNIT: default_dashboard_unit()}
+    agents, units = agents or {}, units or {}
     if not (repo_root / "templates" / "launchd").is_dir():
         try:
             repo_root = (home / ".claude" / "CLAUDE.md").resolve().parent
@@ -1081,28 +1135,50 @@ def check_fleet_agent_drift(
         if missing or unexpected:
             parts = [f"missing `{g}`" for g in missing] + [f"unexpected `{g}`" for g in unexpected]
             drifting.append(f"{label}: {'; '.join(parts)}")
+    agents_drift = bool(drifting)
+    for unit in _FLEET_UNITS:
+        path, template = units.get(unit), repo_root / "templates" / "systemd" / unit
+        if path is None or not path.is_file() or not template.is_file():
+            continue
+        try:
+            args, expected = _unit_exec_start(path), _unit_exec_start(template)
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        checked += 1
+        missing, unexpected = _drift(_argument_groups(expected), _argument_groups(args))
+        if missing or unexpected:
+            parts = [f"missing `{g}`" for g in missing] + [f"unexpected `{g}`" for g in unexpected]
+            drifting.append(f"{unit}: {'; '.join(parts)}")
     name = "Fleet agents"
     if not checked:
         return None
     if not drifting:
         return Finding("fleet-agent-drift", name, "CLEAN", f"{checked} installed agent(s) match their templates")
 
+    try:
+        url = resolve_queue_url()
+    except QueueError:
+        url = None
+    detail = "installed agent no longer matches its template — " + " | ".join(drifting)
+    if not agents_drift:
+        # Linux refuses --worker / --pool: the units are always worker dev.
+        command = f"{repo_root}/scripts/fleet-bootstrap.sh --queue-url {url or 'URL'}"
+        return Finding(
+            "fleet-agent-drift", name, "WARN", detail,
+            f"{command} (re-renders both units from templates/systemd/; a worker with a job "
+            "in flight is left pending restart)",
+        )
     worker = _argument_groups(installed_args.get(WORKER_LABEL, []))
     name_flag = next((g for g in worker if g.startswith("--worker ")), "--worker NAME")
     pools = [g for g in worker if g.startswith("--pool ")] or ["--pool POOL"]
     # Repeated so the re-render keeps them even where the installed plist cannot be read back.
     own = [g for g in worker if g.startswith(("--host ", "--slots "))]
     command = f"{repo_root}/scripts/fleet-bootstrap.sh {name_flag} {' '.join(pools + own)}"
-    try:
-        url = resolve_queue_url()
-    except QueueError:
-        url = None
     command += f" --queue-url {url or 'URL'}"
     if QUEUE_SERVICE_LABEL in installed_args:
         command += " --queue-service"
     return Finding(
-        "fleet-agent-drift", name, "WARN",
-        "installed agent no longer matches its template — " + " | ".join(drifting),
+        "fleet-agent-drift", name, "WARN", detail,
         f"{command} (re-renders every agent from templates/launchd/; --dry-run shows the diff)",
     )
 
@@ -2476,6 +2552,7 @@ def run_doctor(
     dashboard_plist: Path | None = None,
     worker_plist: Path | None = None,
     worker_unit: Path | None = None,
+    dashboard_unit: Path | None = None,
     registry: Registry | None = None,
     dep_probe: Callable[[str], bool] | None = None,
     now: datetime | None = None,
@@ -2496,6 +2573,7 @@ def run_doctor(
     dashboard_plist = dashboard_plist or default_dashboard_plist()
     worker_plist = worker_plist or default_worker_plist()
     worker_unit = worker_unit or default_worker_unit()
+    dashboard_unit = dashboard_unit or default_dashboard_unit()
     registry = registry or Registry()
     dep_probe = dep_probe or _default_dep_probe
 
@@ -2535,7 +2613,7 @@ def run_doctor(
     credentials = check_forge_credentials(agent_path=worker_plist, unit_path=worker_unit)
     if credentials is not None:
         findings.append(credentials)
-    dashboard = check_worker_dashboard(agent_path=worker_plist)
+    dashboard = check_worker_dashboard(agent_path=worker_plist, unit_path=worker_unit)
     if dashboard is not None:
         findings.append(dashboard)
     drift = check_fleet_agent_drift(
@@ -2545,10 +2623,10 @@ def run_doctor(
             DASHBOARD_LABEL: dashboard_plist,
             QUEUE_SERVICE_LABEL: queue_service_plist,
         },
+        units={WORKER_UNIT: worker_unit, DASHBOARD_UNIT: dashboard_unit},
     )
     if drift is not None:
         findings.append(drift)
-    # The Linux unit advertises no dashboard, so there is no worker-dashboard finding for it.
     if worker_plist.exists():
         findings.append(check_worker_self_check())
     elif worker_unit.exists():

@@ -369,7 +369,9 @@ def test_run_doctor_reports_the_worker_and_its_self_check_from_the_unit(tmp_path
     found = {f.check: f for f in report(_unit(tmp_path)).findings}
     assert found["fleet-worker"].status == "FAIL"  # installed, nothing registered yet
     assert "systemctl" in found["worker-self-check"].remedy
-    assert "worker-dashboard" not in found  # the Linux unit advertises no dashboard
+    # Story 35.2-010: a unit from before it advertises no dashboard, and doctor says so.
+    assert found["worker-dashboard"].status == "WARN"
+    assert "fleet-bootstrap.sh" in found["worker-dashboard"].remedy
 
 
 def test_run_doctor_reports_the_units_forge_credentials(tmp_path, monkeypatch) -> None:

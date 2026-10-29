@@ -8,11 +8,14 @@
 # remotely. A headless Linux box has no Keychain, no TCC and no outbound filter
 # in front of its agents.
 #
-# Nothing to substitute: systemd expands %h (the user's home) itself. Install —
-# scripts/fleet-bootstrap.sh does all of this, and is the documented path:
+# systemd expands %h (the user's home) itself. One placeholder, filled by
+# scripts/fleet-bootstrap.sh (the documented install, which does all of this):
+#
+#   __TAILNET_IP__  this box's tailnet address (`tailscale ip -4`)
 #
 #   mkdir -p ~/.config/systemd/user ~/.config/sdlc ~/.local/state/sdlc
-#   cp templates/systemd/sdlc-worker.service ~/.config/systemd/user/
+#   sed "s|__TAILNET_IP__|$(tailscale ip -4)|g" templates/systemd/sdlc-worker.service \
+#       >~/.config/systemd/user/sdlc-worker.service
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now sdlc-worker.service
 #
@@ -68,6 +71,12 @@
 # gate passes a missing scanner as SKIPPED, so a story built here would merge
 # without its SAST and dependency scans.
 #
+# `--dashboard-url` advertises the dashboard the sibling unit (sdlc-dashboard.service,
+# Story 35.2-009) serves on the same tailnet address and port (Story 35.2-010). Each
+# run's fleet record carries it, and the XPS dashboard relays that dashboard for the
+# run's stories, phases and transcripts — without it a run on `dev` reads "detail
+# unavailable" there. A blank address stops the bootstrap before it writes either unit.
+#
 # No `caffeinate` or `systemd-inhibit`: on macOS each job runs under
 # `caffeinate -i` to stop the Mac idle-sleeping mid-build (35.2-004); a server
 # does not sleep, so there is nothing to inhibit.
@@ -81,7 +90,7 @@ Description=sdlc fleet worker dev (claude-shared)
 
 [Service]
 Type=simple
-ExecStart=/nix/var/nix/profiles/default/bin/nix develop %h/.config/nix-dev-env -c sdlc queue run --worker dev --pool claude-shared --pool codex-shared --follow
+ExecStart=/nix/var/nix/profiles/default/bin/nix develop %h/.config/nix-dev-env -c sdlc queue run --worker dev --pool claude-shared --pool codex-shared --dashboard-url http://__TAILNET_IP__:8787 --follow
 
 # systemd --user hands a service a bare PATH. Jobs need `sdlc` (~/.local/bin) and
 # nix itself; the dev shell prepends claude, gh, uv and node to this.

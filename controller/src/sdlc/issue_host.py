@@ -1267,9 +1267,7 @@ class GitHubAdapter(IssueHostAdapter):
         rollup = row.get("statusCheckRollup")
         checks: list[tuple[str, str]] = []
         if isinstance(rollup, list):
-            for item in rollup:
-                if not isinstance(item, dict):
-                    continue
+            for item in _github_latest_checks(rollup):
                 # A CheckRun is named by `name`, a StatusContext by `context`.
                 name = str(item.get("name") or item.get("context") or "")
                 checks.append((name, _github_check_status(item)))
@@ -1787,6 +1785,37 @@ def _github_check_status(item: dict) -> str:
     return _GITHUB_CONCLUSION.get(str(conclusion).upper(), CR_UNKNOWN)
 
 
+def _github_check_recency(item: dict) -> tuple[bool, str]:
+    """Sort key for runs of one check: an in-flight run is newest, then `startedAt`.
+
+    gh emits a zero time for a still-queued run, so `startedAt` alone would rank
+    a fresh re-run below the stale run it replaces.
+    """
+    return _github_check_status(item) == CR_PENDING, str(item.get("startedAt") or "")
+
+
+def _github_latest_checks(rollup: list) -> list[dict]:
+    """Keep only the latest run of each check in a statusCheckRollup.
+
+    A workflow re-triggered on the same head commit (the Risk Gate re-fires on
+    `labeled` / review events) adds a *new* check run beside the old one, and the
+    rollup returns both. GitHub's merge state and `gh pr checks` count only the
+    latest; folding in the superseded red run blocked a merge the human had
+    already approved (story 35.2-010). A check is keyed by workflow + name (a
+    StatusContext by `context`); a nameless entry cannot be matched, so it stays.
+    """
+    latest: dict[object, dict] = {}
+    for index, item in enumerate(rollup):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("context") or "")
+        key: object = (str(item.get("workflowName") or ""), name) if name else index
+        current = latest.get(key)
+        if current is None or _github_check_recency(item) >= _github_check_recency(current):
+            latest[key] = item
+    return list(latest.values())
+
+
 def _github_rollup_status(rollup: object) -> str:
     """Aggregate a GitHub statusCheckRollup to a single normalised `CR_*`.
 
@@ -1796,7 +1825,7 @@ def _github_rollup_status(rollup: object) -> str:
     """
     if not isinstance(rollup, list) or not rollup:
         return CR_NONE
-    statuses = {_github_check_status(item) for item in rollup if isinstance(item, dict)}
+    statuses = {_github_check_status(item) for item in _github_latest_checks(rollup)}
     if CR_FAILED in statuses:
         return CR_FAILED
     if CR_PENDING in statuses:
