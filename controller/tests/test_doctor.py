@@ -1845,6 +1845,16 @@ def test_queue_whois_skips_a_loopback_bind(tmp_path: Path) -> None:
     assert check_queue_whois(path, whois=_broken_whois) is None
 
 
+def test_queue_whois_skips_a_bind_that_is_not_an_ip_address(tmp_path: Path) -> None:
+    # whois takes an address; a hostname bind cannot be asked about.
+    path = tmp_path / "com.fxmartin.sdlc-queue.plist"
+    path.write_bytes(plistlib.dumps({
+        "ProgramArguments": ["sdlc", "queue", "serve", "--bind", "home-lab.test:8790"],
+        "EnvironmentVariables": {"SDLC_QUEUE_ALLOW": "fx@example.com"},
+    }))
+    assert check_queue_whois(path, whois=_broken_whois) is None
+
+
 def test_run_doctor_includes_the_queue_identity_warning(tmp_path: Path, monkeypatch) -> None:
     # The real tailscale_whois, its CLI faked: exits 0 with the GUI's message.
     monkeypatch.setattr(
