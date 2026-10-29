@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -1916,7 +1917,8 @@ def test_run_build_records_transcript_output_paths(tmp_path) -> None:
 def test_ensure_repo_ignores_adds_pattern(tmp_path) -> None:
     from sdlc.build import _ensure_repo_ignores
 
-    (tmp_path / ".git" / "info").mkdir(parents=True)
+    # A real repo: a bare `.git/info` fixture is no repo to git (issue #835).
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     db = tmp_path / ".sdlc-state.db"
     _ensure_repo_ignores(db)
     exclude = tmp_path / ".git" / "info" / "exclude"

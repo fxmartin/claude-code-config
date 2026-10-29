@@ -126,8 +126,11 @@ export SDLC_AGENT_CMD="claude -p --permission-mode acceptEdits --allowedTools Ed
 Each agent's transcript (stdout + stderr) is saved under `<ledger>.logs/<run>/`
 and its path recorded in the ledger (`stages.output_path`), on success and
 failure, so a run is debuggable after the fact. The ledger files
-(`.sdlc-state.db*`) are added to the repo's `.git/info/exclude`, so the
-controller never dirties the repo it builds in.
+(`.sdlc-state.db*`) are added to the repo's `.git/info/exclude` (the shared
+git dir's, from a linked worktree), so the controller never dirties the repo
+it builds in. The exclude is written only when git itself recognises an
+enclosing repository: outside one — or below a stray `.git` directory git does
+not accept — nothing is written and no `.git` is ever created.
 
 ## Development
 
