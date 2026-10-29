@@ -1,6 +1,6 @@
 # Epic 12: Controller Robustness & Failure Recovery
 
-> **Status: COMPLETE (12/12)** — all 12 stories merged on `main` (PRs through #98). Created 2026-06-20 from [issue #72](https://github.com/fxmartin/claude-code-config/issues/72),
+> **Status: IN PROGRESS (12/13)** — 12.2-005 (the ledger exclude is written only inside a real git repository) added 2026-10-29 from issue #835. all 12 stories merged on `main` (PRs through #98). Created 2026-06-20 from [issue #72](https://github.com/fxmartin/claude-code-config/issues/72),
 > a post-mortem of the `sdlc build epic-10` run (ledger run `a07a1855`). Distinct from
 > Epic-10 (which *completed the stub CLI verbs*) and Epic-11 (realtime/multi-run
 > *observability*): this epic makes the controller **resilient** — it should not strand
@@ -50,7 +50,7 @@ next morning. Robustness is what makes "fire-and-forget overnight" actually safe
 
 ## Epic Scope
 
-**Total Stories**: 12 | **Total Points**: 46 | **MVP Stories**: 0 (roadmap — primary defect is Must Have)
+**Total Stories**: 13 | **Total Points**: 48 | **MVP Stories**: 0 (roadmap — primary defect is Must Have)
 
 ## Out of Scope (Non-Goals)
 
@@ -309,6 +309,56 @@ recovered. References 12.2-002 (extends it) and 12.1-001 (envelope recovery).
 
 **Dependencies**: 12.2-002
 **Risk Level**: Medium
+
+##### Story 12.2-005: The ledger exclude is written only inside a real git repository
+**User Story**: As FX, I want the controller to add its ledger exclude only
+to a real repository's git dir, so that running `sdlc` in a directory that
+isn't a repo can never leave a `.git/info/exclude` behind that makes
+everything under it look like a git checkout.
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** a directory with no enclosing repository **When** a ledger is
+  created there **Then** no `.git` file or directory is created or changed.
+- **Given** a `.git` directory that is not a repository (empty, or holding
+  only `info/`, as left by #835 or created by a test fixture) **When** a
+  ledger is created below it **Then** nothing is written, because git does not
+  recognise it as a repo.
+- **Given** a real repository, or a linked worktree whose `.git` is a file
+  **When** a ledger is created **Then** `.sdlc-state.db*` is appended to the
+  shared git dir's `info/exclude` exactly as today, and only once.
+- **Given** `git check-ignore` exits with anything other than 0 or 1 (128:
+  not a repo) **When** the exclude step runs **Then** it writes nothing.
+- **Given** `sdlc build --bogus` (a usage error) in any directory **When** it
+  exits **Then** the directory is untouched.
+
+**Technical Notes**: Issue #835 (2026-10-02, sdlc 2.74.4): a usage-error run
+in `/tmp` left `/tmp/.git/info/exclude`, and two days later Go's VCS stamping
+failed on every `t.TempDir()` under `/tmp` (exit 128), which failed an
+agentic-coding-monitor preflight. The helpers are unchanged since
+`c956dc6` (#744):
+- `_git_common_dir` (`build.py:6430`) accepts any `.git` *directory* as a
+  repo without checking it holds `HEAD`.
+- `_ensure_repo_ignores` (`build.py:6459`) treats a `check-ignore` failure
+  other than exit 0 as "could not say" and carries on, then
+  `exclude.parent.mkdir(parents=True)` creates `info/`.
+Fix: write only when `git -C <start> rev-parse --git-common-dir` succeeds,
+use the dir it names (worktrees included), skip on a `check-ignore` exit
+other than 0/1, and drop `parents=True` so a missing git dir is never
+created. The pure-filesystem lookup was chosen to avoid a subprocess on
+every `Ledger.init()`; one `rev-parse` only when a `.git` is found keeps
+test ledgers outside repos subprocess-free.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: no repo → nothing created; fake `.git` dir → nothing written;
+      real repo and linked worktree → exclude appended once; check-ignore 128
+      → no write; usage error → cwd untouched
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: None
+**Risk Level**: Low
 
 ### Feature 12.3: Honest Run-Terminal Status
 
@@ -622,6 +672,7 @@ members) — but the parser is the root cause.
 12.2-002 (commit-msg lint)      independent
 12.2-003 (auto-migrate at launch) independent
 12.2-004 (compliant commit subjects) extends 12.2-002 (shipped) — independent to build
+12.2-005 (ledger exclude in real repos only) independent
 
 12.3-001 (reconcile core) ──┬─ 12.3-002 (sdlc reconcile verb)   reuses reconcile_run
                             ├─ 12.3-003 (AWAITING_APPROVAL)      reconcile flips to DONE post-approval
