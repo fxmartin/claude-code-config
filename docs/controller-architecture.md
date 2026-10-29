@@ -2357,7 +2357,14 @@ only to HTTPS or localhost origins, never to `http://<tailnet-ip>`. That exposes
 job metadata, never a write; closing it needs a `Host` allowlist.
 
 The token never bypasses (1). Whois answers are cached per peer IP for 60 seconds
-(errors are not cached); a whois that cannot run admits nobody. With no allowlist
+(errors are not cached); a whois that cannot run admits nobody. A whois that
+exits 0 without JSON is a lookup that cannot run too, refused as `identity
+unavailable: <the CLI's first line>`; only valid JSON without a
+`UserProfile.LoginName` is `peer has no Tailscale identity`. **The Tailscale GUI
+app limits this gate on a Mac:** its app-bundle CLI cannot answer under launchd
+(it prints `The Tailscale GUI failed to start: … (Tailscale.CLIError error 3.)`
+and exits 0, #833), so a service there identifies nobody by whois, and
+`SDLC_QUEUE_TOKEN` is the supported path. With no allowlist
 and no token the service refuses to start, and a non-ASCII `SDLC_QUEUE_TOKEN` is
 refused too (header values arrive latin-1 decoded, so it could never match). A
 gate that errors on a request answers 403, never a dropped connection. Tagged
@@ -2384,7 +2391,13 @@ nothing listens or the plist is unusable (remedy: `launchctl kickstart -k
 gui/$(id -u)/com.fxmartin.sdlc-queue`, then the log the plist's own
 `StandardErrorPath` names), **WARN** when the service's store is not
 the one this shell's `sdlc queue` uses. The probe is a bare connect, not an HTTP
-call: the API refuses unauthenticated callers and doctor stays read-only. This
+call: the API refuses unauthenticated callers and doctor stays read-only. When
+the plist sets an identity allowlist, doctor also runs `tailscale whois` against
+its own `--bind` address (`check_queue_whois`, finding `queue-identity`): a
+lookup that fails is a **WARN** quoting the CLI's message, with
+`SDLC_QUEUE_TOKEN` as the remedy. A lookup that answers, no allowlist or a
+loopback bind adds no finding. Doctor asks from your shell, not from launchd, so
+a CLI that only fails under launchd can still pass here. This
 supersedes the 30.3-001 pattern for the queue; `sdlc listen` keeps its own.
 
 **nix-install wiring.** The nix side lands in `nix-install` (home-lab only) and

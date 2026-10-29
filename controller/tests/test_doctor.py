@@ -25,11 +25,13 @@ from sdlc.doctor import (
     check_harness_pin,
     check_model_coverage,
     check_queue_service,
+    check_queue_whois,
     check_usage_agreement,
     run_doctor,
     worst_status,
 )
 from sdlc.model_backfill import backfill_models
+from sdlc.queue_server import WhoisUnavailable
 from sdlc.registry import Registry, RunRecord
 
 runner = CliRunner()
@@ -1767,6 +1769,97 @@ def test_run_doctor_queue_service_defaults_to_the_launchagents_plist(
 ) -> None:
     # HOME is a fresh tmp dir (autouse fixture): no plist, so not applicable.
     assert _finding(_doctor(tmp_path), "queue-service").status == "CLEAN"
+
+
+# --- queue identity lookup (Story 35.1-005) -----------------------------------
+
+_GUI_FAILURE = (
+    "The Tailscale GUI failed to start: The operation couldn't be completed. "
+    "(Tailscale.CLIError error 3.)"
+)
+
+
+def _allow_plist(tmp_path: Path, *, env_allow: str | None = None, args: list[str] = ()) -> Path:
+    env = {"SDLC_QUEUE_ALLOW": env_allow} if env_allow is not None else {}
+    path = tmp_path / "com.fxmartin.sdlc-queue.plist"
+    path.write_bytes(plistlib.dumps({
+        "ProgramArguments": ["/usr/local/bin/sdlc", "queue", "serve", "--bind", "100.101.102.103:8790", *args],
+        "EnvironmentVariables": env,
+    }))
+    return path
+
+
+def _broken_whois(ip: str) -> str | None:
+    raise WhoisUnavailable(_GUI_FAILURE)
+
+
+def test_queue_whois_failing_self_lookup_warns_with_the_cli_message(tmp_path: Path) -> None:
+    seen: list[str] = []
+
+    def whois(ip: str) -> str | None:
+        seen.append(ip)
+        return _broken_whois(ip)
+
+    finding = check_queue_whois(_allow_plist(tmp_path, env_allow="fx@example.com"), whois=whois)
+    assert finding is not None
+    assert (finding.check, finding.status) == ("queue-identity", "WARN")
+    assert seen == ["100.101.102.103"]
+    assert _GUI_FAILURE in finding.detail
+    assert "SDLC_QUEUE_TOKEN" in finding.remedy
+
+
+@pytest.mark.parametrize("args", [["--allow", "fx@example.com"], ["--allow=fx@example.com"]])
+def test_queue_whois_reads_the_allowlist_from_the_arguments_too(tmp_path: Path, args) -> None:
+    finding = check_queue_whois(_allow_plist(tmp_path, args=args), whois=_broken_whois)
+    assert finding is not None and finding.status == "WARN"
+
+
+@pytest.mark.parametrize("login", ["fx@example.com", None])
+def test_queue_whois_that_answers_reports_nothing(tmp_path: Path, login) -> None:
+    plist = _allow_plist(tmp_path, env_allow="fx@example.com")
+    assert check_queue_whois(plist, whois=lambda ip: login) is None
+
+
+@pytest.mark.parametrize("env_allow", [None, "", " , "])
+def test_queue_whois_without_an_allowlist_is_not_asked(tmp_path: Path, env_allow) -> None:
+    def whois(ip: str) -> str | None:
+        raise AssertionError("whois must not run without an allowlist")
+
+    assert check_queue_whois(_allow_plist(tmp_path, env_allow=env_allow), whois=whois) is None
+
+
+def test_queue_whois_not_applicable_without_a_usable_plist(tmp_path: Path) -> None:
+    assert check_queue_whois(tmp_path / "absent.plist", whois=_broken_whois) is None
+    garbage = tmp_path / "garbage.plist"
+    garbage.write_text("not a plist")
+    assert check_queue_whois(garbage, whois=_broken_whois) is None  # queue-service FAILs it
+
+
+def test_queue_whois_skips_a_loopback_bind(tmp_path: Path) -> None:
+    # Whois cannot vouch for a loopback peer; such a bind runs on the token.
+    path = tmp_path / "com.fxmartin.sdlc-queue.plist"
+    path.write_bytes(plistlib.dumps({
+        "ProgramArguments": ["sdlc", "queue", "serve", "--bind", "127.0.0.1:8790"],
+        "EnvironmentVariables": {"SDLC_QUEUE_ALLOW": "fx@example.com"},
+    }))
+    assert check_queue_whois(path, whois=_broken_whois) is None
+
+
+def test_run_doctor_includes_the_queue_identity_warning(tmp_path: Path, monkeypatch) -> None:
+    # The real tailscale_whois, its CLI faked: exits 0 with the GUI's message.
+    monkeypatch.setattr(
+        "sdlc.queue_server.subprocess.run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=f"{_GUI_FAILURE}\n", stderr=""),
+    )
+    path = tmp_path / "com.fxmartin.sdlc-queue.plist"
+    # A non-numeric port keeps queue-service's real TCP probe from running.
+    path.write_bytes(plistlib.dumps({
+        "ProgramArguments": ["sdlc", "queue", "serve", "--bind", "100.101.102.103:notaport"],
+        "EnvironmentVariables": {"SDLC_QUEUE_ALLOW": "fx@example.com"},
+    }))
+    finding = _finding(_doctor(tmp_path, queue_service_plist=path), "queue-identity")
+    assert finding.status == "WARN"
+    assert _GUI_FAILURE in finding.detail
 
 
 def _plist_with_args(tmp_path: Path, args: list[str]) -> Path:

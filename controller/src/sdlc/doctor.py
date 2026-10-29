@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import itertools
 import json
 import os
@@ -38,6 +39,7 @@ from sdlc.queue_client import (
     resolve_queue_token,
     resolve_queue_url,
 )
+from sdlc.queue_server import WhoisUnavailable, tailscale_whois
 from sdlc.registry import Registry, derive_state, registry_path_for
 from sdlc.worker_selfcheck import WORKER_UNIT
 
@@ -57,6 +59,7 @@ __all__ = [
     "check_model_coverage",
     "check_model_routing",
     "check_queue_service",
+    "check_queue_whois",
     "check_registry_path",
     "check_stashes",
     "check_usage_agreement",
@@ -1712,6 +1715,53 @@ def check_queue_service(
     return Finding("queue-service", name, "CLEAN", detail)
 
 
+def check_queue_whois(
+    plist_path: Path,
+    *,
+    whois: Callable[[str], str | None] = tailscale_whois,
+) -> Finding | None:
+    """Can `tailscale whois` answer for this host's own tailnet address? (Story 35.1-005)
+
+    Only a queue agent with an identity allowlist (``--allow`` or
+    ``SDLC_QUEUE_ALLOW`` in its plist) asks whois per request, so only then is it
+    worth asking here, against the agent's own ``--bind`` address. A lookup that
+    fails is a **WARN** quoting the CLI: on a Mac running the Tailscale GUI app
+    the CLI cannot answer under launchd (#833), and every allowlisted peer would
+    be refused as "identity unavailable". ``None`` when there is no agent, no
+    allowlist, a loopback bind (token-only by design) or the lookup answers;
+    an unusable plist is :func:`check_queue_service`'s FAIL, not this check's.
+    """
+    if not plist_path.is_file():
+        return None
+    try:
+        plist = plistlib.loads(plist_path.read_bytes())
+        args = [str(a) for a in plist.get("ProgramArguments", [])]
+        env = {str(k): str(v) for k, v in (plist.get("EnvironmentVariables") or {}).items()}
+    except Exception:  # noqa: BLE001 - see check_queue_service
+        return None
+    allowlist = [_plist_option(args, "--allow") or "", *env.get("SDLC_QUEUE_ALLOW", "").split(",")]
+    bind = _plist_bind(args)
+    if not any(entry.strip() for entry in allowlist) or bind is None:
+        return None
+    host = bind.rpartition(":")[0].strip("[]")
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return None
+    except ValueError:
+        return None
+    try:
+        whois(host)
+    except WhoisUnavailable as exc:
+        return Finding(
+            "queue-identity", "Queue identity lookup", "WARN",
+            f"`tailscale whois {host}` cannot answer: {exc} — the service refuses "
+            "every allowlisted peer as \"identity unavailable\"",
+            "on a Mac running the Tailscale GUI app the CLI cannot answer under launchd: "
+            "give each worker SDLC_QUEUE_TOKEN (the service's shared secret) instead",
+        )
+    return None
+
+
 def check_runs(
     ledger: Ledger,
     registry: Registry,
@@ -2597,6 +2647,9 @@ def run_doctor(
     ]
     findings.extend(check_dependencies(dep_probe))
     findings.append(check_glab_dependency(repo_root, dep_probe))
+    queue_identity = check_queue_whois(queue_service_plist)
+    if queue_identity is not None:
+        findings.append(queue_identity)
     fleet = check_fleet_queue_configured(agent_path=worker_plist, unit_path=worker_unit)
     if fleet is not None:
         findings.append(fleet)

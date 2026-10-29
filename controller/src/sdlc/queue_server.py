@@ -73,7 +73,7 @@ class BindError(ValueError):
 
 
 class WhoisUnavailable(RuntimeError):
-    """``tailscale whois`` could not be asked (no CLI, daemon down, timeout)."""
+    """``tailscale whois`` could not answer (no CLI, daemon down, timeout, non-JSON output)."""
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +134,9 @@ def parse_bind(spec: str) -> tuple[str, int]:
 def tailscale_whois(ip: str) -> str | None:
     """The Tailscale login name behind ``ip``, or ``None`` when it has none.
 
-    Raises :class:`WhoisUnavailable` when the CLI cannot be asked at all — the
-    caller must treat that as "cannot vouch", never as "allowed".
+    Raises :class:`WhoisUnavailable` when the CLI cannot be asked at all, or
+    answers with something other than JSON — the caller must treat that as
+    "cannot vouch", never as "allowed" nor as "no identity".
     """
     try:
         proc = subprocess.run(
@@ -151,10 +152,23 @@ def tailscale_whois(ip: str) -> str | None:
         raise WhoisUnavailable(f"tailscale whois exited {proc.returncode}: {proc.stderr.strip()}")
     try:
         payload = json.loads(proc.stdout)
+    except ValueError as exc:
+        # Issue #833: the app-bundle CLI under launchd prints "The Tailscale GUI
+        # failed to start: …" and exits 0. That is a broken lookup on this host,
+        # not a peer without an identity, so say what the CLI said.
+        raise WhoisUnavailable(
+            _first_line(proc.stdout) or _first_line(proc.stderr) or "tailscale whois printed no JSON"
+        ) from exc
+    try:
         login = payload["UserProfile"]["LoginName"]
-    except (ValueError, KeyError, TypeError):
+    except (KeyError, TypeError):
         return None
     return login if isinstance(login, str) and login else None
+
+
+def _first_line(text: str | None) -> str:
+    """The first non-blank line of ``text``, stripped (``""`` when there is none)."""
+    return next((line.strip() for line in (text or "").splitlines() if line.strip()), "")
 
 
 @dataclass(frozen=True)
