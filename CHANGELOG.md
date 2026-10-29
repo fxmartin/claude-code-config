@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.123.0] - 2026-10-29
+
+### Added
+
+- feat(fleet-execution): the linux worker advertises its (#35.2-010)
+
+### Fixed
+
+- fix(fleet-execution): the linux worker advertises its (#35.2-010)
+- fix(fleet-execution): the linux worker advertises its (#35.2-010)
+
+
 ## [v2.122.0] - 2026-10-28
 
 ### Added
