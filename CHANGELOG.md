@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.126.0] - 2026-10-29
+
+### Added
+
+- feat(controller-robustness): the ledger exclude is written (#12.2-005)
+
+
 ## [v2.125.0] - 2026-10-29
 
 ### Added
