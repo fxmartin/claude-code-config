@@ -149,6 +149,19 @@ def test_check_ignore_oserror_writes_nothing(tmp_path, monkeypatch) -> None:
     assert exclude.read_text(encoding="utf-8") == before
 
 
+def test_rev_parse_failure_writes_nothing(tmp_path, monkeypatch) -> None:
+    root = _init_repo(tmp_path)
+    exclude = root / ".git" / "info" / "exclude"
+    before = exclude.read_text(encoding="utf-8")
+
+    def broken_git(where: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(["git", *args], 10)
+
+    monkeypatch.setattr(build, "_git", broken_git)
+    _ensure_repo_ignores(root / ".sdlc-state.db")
+    assert exclude.read_text(encoding="utf-8") == before
+
+
 def test_no_git_dir_is_subprocess_free(tmp_path, monkeypatch) -> None:
     """Test ledgers outside any repo must not pay for a git subprocess."""
     calls: list[tuple[str, ...]] = []
