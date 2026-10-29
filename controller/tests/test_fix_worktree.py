@@ -17,7 +17,7 @@ from test_fix_issue import (
 
 import sdlc.fix_issue as fix_mod
 from sdlc.build import WorktreeError, create_story_worktree
-from sdlc.dispatch import RateLimitError, RateLimitSignal
+from sdlc.dispatch import AgentDispatchError, RateLimitError, RateLimitSignal
 from sdlc.fix_issue import (
     FixBatchOptions,
     FixOptions,
@@ -390,6 +390,59 @@ def test_resume_refuses_when_the_worktree_cannot_be_recovered(
     # Left resumable: the refusal does not touch the parked run's status.
     assert Ledger(db).run_row(parked.run_id)["status"] == parked_status
     assert Ledger(db).story_status(parked.run_id, "issue-1") == "RATE_LIMITED"
+
+
+# ---------------------------------------------------------------------------
+# AC3: every early terminal exit tears the worktree down, the checkout untouched
+# ---------------------------------------------------------------------------
+
+
+def _early_exit_run(tmp_path, monkeypatch, *, agent, preflight):
+    root = _dirty_checkout(tmp_path)
+    monkeypatch.chdir(root)
+    before = _checkout_state(root)
+    monkeypatch.setattr(fix_mod, "dispatch_agent", agent)
+    result = run_fix(
+        FixOptions(issue=1),
+        ledger=Ledger(tmp_path / ".sdlc-state.db"),
+        preflight=preflight,
+        runner=FakeGh(_issue_json()),
+    )
+    workdir = _expected_worktree(root, result.run_id)
+    assert not workdir.exists()
+    assert workdir.resolve() not in _registered_worktrees(root)
+    assert _checkout_state(root) == before
+    return result
+
+
+def test_failed_preflight_tears_the_worktree_down(tmp_path, monkeypatch) -> None:
+    agent = WorktreeAgent()
+    result = _early_exit_run(tmp_path, monkeypatch, agent=agent, preflight=lambda: False)
+
+    assert result.status == "FAILED"
+    assert result.preflight_failed is True
+    assert agent.calls == []
+
+
+def test_blocked_investigation_tears_the_worktree_down(tmp_path, monkeypatch) -> None:
+    blocked = {
+        "root_cause": "unclear", "complexity": "HIGH", "fix_approach": "needs design",
+        "files_to_modify": [], "risk": "high", "investigation_status": "BLOCKED",
+    }
+    agent = WorktreeAgent(overrides={"investigation": blocked})
+    result = _early_exit_run(tmp_path, monkeypatch, agent=agent, preflight=lambda: True)
+
+    assert result.status == "ABORTED"
+    assert result.investigation_blocked is True
+    assert "build" not in agent.agents()
+
+
+def test_failed_investigation_tears_the_worktree_down(tmp_path, monkeypatch) -> None:
+    agent = WorktreeAgent(overrides={"investigation": AgentDispatchError("agent crashed")})
+    result = _early_exit_run(tmp_path, monkeypatch, agent=agent, preflight=lambda: True)
+
+    assert result.status == "FAILED"
+    assert "build" not in agent.agents()
 
 
 # ---------------------------------------------------------------------------
