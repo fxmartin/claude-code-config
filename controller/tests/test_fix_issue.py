@@ -223,6 +223,22 @@ def _ledger(tmp_path) -> Ledger:
     return Ledger(tmp_path / ".sdlc-state.db")
 
 
+def _sandbox_real_run(monkeypatch, tmp_path) -> None:
+    """Keep a real-run (`dispatcher=None`) test off this repo's git (Story 35.5-011).
+
+    A real fix cuts its worktree under the cwd, so the test runs from ``tmp_path``
+    and gets a plain directory in place of a git worktree.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    def fake_create(root, story_id, run_id):
+        path = tmp_path / f"wt-{story_id}"
+        path.mkdir(exist_ok=True)
+        return path
+
+    monkeypatch.setattr(fix_mod, "create_story_worktree", fake_create)
+
+
 def _run_count(db: Path) -> int:
     conn = sqlite3.connect(db)
     try:
@@ -993,45 +1009,6 @@ def test_lint_fix_stage_commit_malformed_reask_is_not_recovered(tmp_path, monkey
         ).fetchall()
     ]
     assert any("commit-lint re-ask response malformed" in m for m in msgs)
-
-
-# ---------------------------------------------------------------------------
-# Issue #590: dirty shared-checkout guard refuses before any dispatch.
-# ---------------------------------------------------------------------------
-
-
-def test_run_fix_refuses_on_dirty_tree(tmp_path) -> None:
-    gh = FakeGh(_issue_json())
-    dispatch = RecordingDispatcher()
-    result = run_fix(
-        FixOptions(issue=1),
-        ledger=_ledger(tmp_path),
-        dispatcher=dispatch,
-        preflight=lambda: True,
-        runner=gh,
-        root=tmp_path,
-        dirty_check=lambda: ["src/dirty.py"],
-    )
-    assert result.status == "ABORTED"
-    assert result.dirty_tree == ["src/dirty.py"]
-    assert dispatch.agents() == []
-
-
-def test_run_fix_batch_refuses_on_dirty_tree(tmp_path) -> None:
-    gh = FakeBatchGh([_batch_issue(1)])
-    dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["a.py"]})
-    result = run_fix_batch(
-        FixBatchOptions(target="all", concurrency=1),
-        ledger=_ledger(tmp_path),
-        dispatcher=dispatch,
-        preflight=lambda: True,
-        runner=gh,
-        root=tmp_path,
-        dirty_check=lambda: ["src/dirty.py"],
-    )
-    assert result.status == "ABORTED"
-    assert result.dirty_tree == ["src/dirty.py"]
-    assert result.summary == "refused to start: uncommitted changes in the working tree"
 
 
 # ---------------------------------------------------------------------------
@@ -3165,10 +3142,10 @@ def test_batch_real_run_isolates_worktrees_and_captures_worker_exception(
     tmp_path, monkeypatch
 ) -> None:
     """The real-run path (`dispatcher=None`): concurrent issues get isolated
-    worktrees, the base ref is refreshed/repositioned around the ready queue, an
-    unavailable worktree falls back to the shared repo root instead of crashing,
-    and an unexpected exception in an isolated worker still cleans up its
-    worktree (issue #436)."""
+    worktrees, the base ref is refreshed before the ready queue, an unavailable
+    worktree fails that issue instead of building in the checkout (Story
+    35.5-011), the checkout is never repositioned, and an unexpected exception in
+    an isolated worker still cleans up its worktree (issue #436)."""
     import sdlc.fix_issue as fix_issue_module
 
     monkeypatch.chdir(tmp_path)
@@ -3182,13 +3159,12 @@ def test_batch_real_run_isolates_worktrees_and_captures_worker_exception(
     created: list[str] = []
     removed: list[Path] = []
     refreshed: list[Path] = []
-    repositioned: list[Path] = []
 
     def fake_create(root, story_id, run_id):
         created.append(story_id)
         if story_id == "issue-1":
-            # issue-1's worktree isolation is unavailable; it must fall back to
-            # building in the shared repo root rather than crashing the batch.
+            # issue-1's worktree isolation is unavailable; it must fail with the
+            # reason rather than build in the checkout or crash the batch.
             raise WorktreeError("no space left on device")
         d = tmp_path / f"wt-{story_id}"
         d.mkdir(exist_ok=True)
@@ -3205,9 +3181,6 @@ def test_batch_real_run_isolates_worktrees_and_captures_worker_exception(
         fix_issue_module, "_refresh_base_ref", lambda root: refreshed.append(root)
     )
     monkeypatch.setattr(
-        fix_issue_module, "_reposition_head", lambda root: repositioned.append(root)
-    )
-    monkeypatch.setattr(
         "sdlc.reconcile.reconcile_run", lambda *a, **k: _FakeReconcile()
     )
 
@@ -3220,14 +3193,19 @@ def test_batch_real_run_isolates_worktrees_and_captures_worker_exception(
         root=tmp_path,
     )
 
-    assert set(created) == {"issue-1", "issue-2", "issue-3"}  # all attempted
-    # issue-1 never got a worktree (WorktreeError fallback); issue-2's raised
-    # mid-pipeline but its isolated worktree is still cleaned up on the error path.
-    assert set(removed) == {tmp_path / "wt-issue-2", tmp_path / "wt-issue-3"}
+    # Every issue attempted, plus the batch doc-update phase's own worktree.
+    assert set(created) == {"issue-1", "issue-2", "issue-3", "doc-update"}
+    # issue-1 never got a worktree (refused); issue-2's raised mid-pipeline but
+    # its isolated worktree is still cleaned up on the error path. The batch
+    # doc-update phase gets (and drops) a worktree of its own.
+    assert set(removed) == {
+        tmp_path / "wt-issue-2", tmp_path / "wt-issue-3", tmp_path / "wt-doc-update",
+    }
     assert refreshed  # before_batch fired the real-run base refresh
-    assert repositioned  # real-run HEAD reposition after the ready queue drains
-    assert result.failed == 1  # issue-2's unexpected exception is captured, not fatal
-    assert result.fixed == 2  # issue-1 and issue-3 still complete normally
+    # issue-1 refused for want of a worktree; issue-2's exception is captured.
+    assert result.failed == 2
+    assert result.fixed == 1  # issue-3 still completes normally
+    assert not any(c == ("build", "issue-1") for c in dispatch.calls)
 
 
 def test_batch_real_run_registers_to_env_registry_not_default_home(
@@ -3244,13 +3222,12 @@ def test_batch_real_run_registers_to_env_registry_not_default_home(
     fake_home = tmp_path / "fake_home"
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
-    monkeypatch.chdir(tmp_path)
+    _sandbox_real_run(monkeypatch, tmp_path)
 
     gh = FakeBatchGh([_batch_issue(1)])
     dispatch = BatchProbeDispatcher(inv_files={"issue-1": ["a.py"]})
     monkeypatch.setattr(fix_issue_module, "dispatch_agent", dispatch)
     monkeypatch.setattr(fix_issue_module, "_refresh_base_ref", lambda root: None)
-    monkeypatch.setattr(fix_issue_module, "_reposition_head", lambda root: None)
     monkeypatch.setattr("sdlc.reconcile.reconcile_run", lambda *a, **k: None)
 
     result = run_fix_batch(
@@ -4220,6 +4197,7 @@ def test_run_fix_registers_to_env_registry_not_default_home(
     fake_home = tmp_path / "fake_home"
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    _sandbox_real_run(monkeypatch, tmp_path)
     monkeypatch.setattr(fix_issue_module, "dispatch_agent", RecordingDispatcher())
 
     result = run_fix(
@@ -4825,6 +4803,7 @@ def test_resume_fix_registers_to_env_registry_not_default_home(
     fake_home = tmp_path / "fake_home"
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    _sandbox_real_run(monkeypatch, tmp_path)
     monkeypatch.setattr(fix_mod, "dispatch_agent", RecordingDispatcher())
 
     result = fix_mod.resume_fix(

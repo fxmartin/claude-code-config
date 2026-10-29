@@ -426,7 +426,6 @@ def test_run_fix_refuses_merge_on_an_undenied_harness(tmp_path) -> None:
         preflight=lambda: True,
         runner=FakeGh(_issue_json()),
         root=tmp_path,
-        dirty_check=lambda: [],
     )
 
     assert result.status == "ABORTED"
@@ -443,7 +442,6 @@ def test_run_fix_proceeds_with_build_on_an_undenied_harness(tmp_path) -> None:
         preflight=lambda: True,
         runner=FakeGh(_issue_json()),
         root=tmp_path,
-        dirty_check=lambda: [],
     )
     assert result.undenied_host_auth == []
     assert result.run_id is not None
@@ -460,7 +458,6 @@ def test_run_fix_allow_undenied_proceeds_and_warns(tmp_path) -> None:
         preflight=lambda: True,
         runner=FakeGh(_issue_json()),
         root=tmp_path,
-        dirty_check=lambda: [],
     )
 
     assert result.undenied_host_auth == []
@@ -486,7 +483,6 @@ def test_run_fix_batch_refuses_merge_on_an_undenied_harness(tmp_path) -> None:
         preflight=lambda: True,
         runner=FakeBatchGh([_batch_issue(1)]),
         root=tmp_path,
-        dirty_check=lambda: [],
         registry=Registry(tmp_path / "registry.json"),
     )
 
@@ -506,7 +502,6 @@ def test_run_fix_batch_allow_undenied_proceeds(tmp_path) -> None:
         preflight=lambda: True,
         runner=FakeBatchGh([_batch_issue(1)]),
         root=tmp_path,
-        dirty_check=lambda: [],
         registry=Registry(tmp_path / "registry.json"),
     )
     assert result.undenied_host_auth == []

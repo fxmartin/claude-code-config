@@ -753,7 +753,8 @@ Flags:
   --skip-coverage           build agent opens the PR directly (no coverage gate)
   --coverage-threshold=N    required new-code coverage % (default 90)
   --skip-preflight          skip the preflight quality gate
-  --allow-dirty             start even with uncommitted changes (issue #590)
+  --allow-dirty             no effect: a fix runs in its own worktree and never
+                            touches the checkout (kept for compatibility)
   --allow-undenied          start even with a host-auth role (merge/review) routed
                             to a harness that renders no deny baseline (issue #654)
   --force                   take over a run/scope another (dead) process still shows live (issue #595)
@@ -765,6 +766,11 @@ Flags:
   --ci-gate-no-ci=allow|deny  merge CI gate: merge or refuse when no pipeline exists (default allow)
 
 \b
+Every issue is fixed in its own worktree (`.claude/worktrees/agent-<run>-issue-<N>`)
+on `feature/issue-<N>`; your checkout's branch, index and uncommitted changes are
+never touched. The worktree is removed when the fix closes (branch/PR kept) and
+kept for `sdlc resume` when the fix parks on a rate limit.
+
 Batch runs investigate every issue first, then serialize only issues that touch
 overlapping files while independent ones run concurrently. The run appears in
 `sdlc dashboard` beside `sdlc build` runs.
@@ -843,15 +849,6 @@ def fix(ctx: typer.Context) -> None:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
 
-    if result.dirty_tree:
-        # Issue #590: refused before any dispatch — nothing was stashed or moved.
-        from sdlc.build import format_dirty_tree
-
-        typer.echo(
-            format_dirty_tree(Path.cwd(), result.dirty_tree, "sdlc fix"), err=True
-        )
-        raise typer.Exit(code=1)
-
     if result.undenied_host_auth:
         # Issue #654: refused before any dispatch — a host-auth role was routed to
         # a harness that renders no deny baseline.
@@ -897,15 +894,6 @@ def _run_fix_batch_cli(opts, ledger, run_fix_batch, make_render_view) -> None:
     result = run_fix_batch(
         opts, ledger=ledger, render_view=make_render_view(ledger.db_path)
     )
-
-    if result.dirty_tree:
-        # Issue #590: refused before any dispatch — nothing was stashed or moved.
-        from sdlc.build import format_dirty_tree
-
-        typer.echo(
-            format_dirty_tree(Path.cwd(), result.dirty_tree, "sdlc fix"), err=True
-        )
-        raise typer.Exit(code=1)
 
     if result.undenied_host_auth:
         # Issue #654: refused before any dispatch — a host-auth role was routed to
