@@ -6430,29 +6430,26 @@ _CANONICAL_STAGE_ORDER = ("investigation",) + _STAGES
 def _git_common_dir(start: Path) -> Path | None:
     """The git dir whose ``info/exclude`` governs ``start``, or None outside a repo.
 
-    Pure filesystem, no subprocess (this runs on every ``Ledger.init()``, and
-    most test ledgers live outside any repo). A ``.git`` directory is the repo
-    itself. A ``.git`` *file* is a linked worktree (issue #739): it names its
-    private gitdir, whose ``commondir`` file points back at the shared git dir —
-    the only one git reads ``info/exclude`` from.
+    A filesystem walk first: most test ledgers live outside any repo and this
+    runs on every ``Ledger.init()``, so no ``.git`` above ``start`` means no
+    subprocess. Only when one is found does git decide (issue #835): a ``.git``
+    directory holding just ``info/`` — or nothing — is not a repository, and
+    trusting it let a run in ``/tmp`` turn every directory below into a fake
+    checkout. ``rev-parse --git-common-dir`` also resolves a linked worktree
+    (issue #739) to the shared git dir, the only one git reads
+    ``info/exclude`` from.
     """
-    for d in (start, *start.parents):
-        dot_git = d / ".git"
-        if dot_git.is_dir():
-            return dot_git
-        if dot_git.is_file():
-            text = dot_git.read_text(encoding="utf-8").strip()
-            if not text.startswith("gitdir:"):
-                return None
-            private = Path(text[len("gitdir:"):].strip())
-            if not private.is_absolute():
-                private = (d / private).resolve()
-            common_file = private / "commondir"
-            if not common_file.is_file():
-                return private
-            common = Path(common_file.read_text(encoding="utf-8").strip())
-            return common if common.is_absolute() else (private / common).resolve()
-    return None
+    if not any((d / ".git").exists() for d in (start, *start.parents)):
+        return None
+    try:
+        proc = _git(start, "rev-parse", "--git-common-dir")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    common = proc.stdout.strip()
+    if proc.returncode != 0 or not common:
+        return None
+    path = Path(common)
+    return path if path.is_absolute() else (start / path).resolve()
 
 
 def _ensure_repo_ignores(db_path: Path) -> None:
@@ -6465,7 +6462,8 @@ def _ensure_repo_ignores(db_path: Path) -> None:
     :meth:`Ledger.init` so every creator is covered (issue #739: it was wired
     into ``run_build`` only, and ``sdlc fix`` left ledgers untracked). A repo
     whose own rules already ignore the ledger is left untouched. Best-effort:
-    silently does nothing when there is no enclosing git repo.
+    silently does nothing when git does not recognise an enclosing repo, or
+    cannot say whether the ledger is already ignored (issue #835).
     """
     pattern = ".sdlc-state.db*"
     try:
@@ -6476,13 +6474,15 @@ def _ensure_repo_ignores(db_path: Path) -> None:
             return
         try:
             # Exit 0 = already ignored (by .gitignore or a prior exclude): nothing
-            # to write. 1 = not ignored; anything else = git could not say.
-            if _git(start, "check-ignore", "-q", db_path.name).returncode == 0:
+            # to write. 1 = not ignored: write. Anything else (128: not a repo) =
+            # git could not say, and a guess is how #835 seeded /tmp/.git.
+            if _git(start, "check-ignore", "-q", db_path.name).returncode != 1:
                 return
         except (OSError, subprocess.SubprocessError):
-            pass
+            return
         exclude = git_dir / "info" / "exclude"
-        exclude.parent.mkdir(parents=True, exist_ok=True)
+        # No ``parents=True``: the git dir git just named must already exist.
+        exclude.parent.mkdir(exist_ok=True)
         existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
         if pattern in existing.split():
             return
