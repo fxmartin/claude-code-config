@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.124.0] - 2026-10-29
+
+### Added
+
+- feat(fleet-execution): a broken `tailscale whois` is (#35.1-005)
+
+
 ## [v2.123.0] - 2026-10-29
 
 ### Added
