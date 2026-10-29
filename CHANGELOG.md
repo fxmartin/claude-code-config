@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.125.0] - 2026-10-29
+
+### Added
+
+- feat(fleet-execution): `sdlc fix` runs in its own worktree (#35.5-011)
+
+
 ## [v2.124.0] - 2026-10-29
 
 ### Added
