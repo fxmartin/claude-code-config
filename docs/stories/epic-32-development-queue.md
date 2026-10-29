@@ -1,6 +1,6 @@
 # Epic 32: Development Queue
 
-> **Status: NOT STARTED (0/8)** — authored 2026-09-07 from `docs/development-queue-investigation.md`.
+> **Status: COMPLETE (8/8)** — all 8 stories merged by 2026-09-07..10 (#664–#669, #725, `dcc794f`; Done markers backfilled 2026-10-29). authored 2026-09-07 from `docs/development-queue-investigation.md`.
 > Thesis: `sdlc build` and `sdlc fix` are imperative, foreground, one-run-per-invocation commands —
 > whoever types them is the scheduler. Twelve stories shipped in the last 48 hours by a human typing
 > `build`, waiting, labelling, typing `resume`, and overnight by a shell `for` loop that was a queue
@@ -72,6 +72,7 @@ lets same-repo jobs overlap.
 #### Stories
 
 ##### Story 32.1-001: Queue store and `sdlc queue` verbs
+**Status**: Done
 **User Story**: As FX, I want `sdlc build --enqueue <scope>` and `sdlc fix --enqueue <issue>` to record a
 job in a host-level queue instead of running it, and `sdlc queue list|add|cancel|prioritise` to manage
 that list, so that work can be declared now and executed later, in an order I control, by something
@@ -113,6 +114,7 @@ so a job replays with the options it was enqueued with.
 **Risk Level**: Low
 
 ##### Story 32.1-002: Scheduler loop with leased claims, per-repo exclusivity, and host agent slots
+**Status**: Done
 **User Story**: As FX, I want `sdlc queue run` to claim queued jobs and start them with the existing
 `build`/`fix` machinery, holding a short renewable lease per job, never running two fix jobs — or, until
 32.1-003, two runs of any kind — in one repo, and never exceeding a host-wide agent-slot cap, so that a
@@ -159,6 +161,7 @@ can enqueue while it drains.
 **Risk Level**: High
 
 ##### Story 32.1-003: Status markers off the shared checkout
+**Status**: Done
 **User Story**: As FX, I want the controller to stop writing `**Status**: Done` markers into
 `docs/stories/*.md` in the shared checkout during a run — deriving the markdown view from the ledger on
 demand instead — so that two build jobs in one repo can overlap without the #590 dirty-tree guard
@@ -198,6 +201,7 @@ The two coordination points that today cost the most wall-clock and human attent
 #### Stories
 
 ##### Story 32.2-001: One rate-limit window for the whole queue
+**Status**: Done
 **User Story**: As FX on one Max subscription shared by every repo, I want a job that parks on
 `RATE_LIMITED` to pause **all** dispatch until the reset, and the queue to resume everything itself at
 that moment, so that the window is discovered once and waited out once, not once per repo.
@@ -228,6 +232,7 @@ column, not a new detector. Do not move rate-limit truth out of the ledger; the 
 **Risk Level**: Medium
 
 ##### Story 32.2-002: Approval-aware queue — re-poll and auto-resume
+**Status**: Done
 **User Story**: As FX, I want a job that parks `AWAITING_APPROVAL` to be re-polled by the queue, resumed
 the moment its PR carries `risk-approved` (or an approving review), and its story driven to DONE with
 its PR recorded — so that a night's high-risk fixes are waiting for my label in the morning, not for my
@@ -260,6 +265,7 @@ human steps per night; it is the one to demo.
 **Risk Level**: Medium
 
 ##### Story 32.2-003: Operator-declared limit reset — clear the shared pause and re-arm parked runs
+**Status**: Done
 **User Story**: As FX after resetting the Max usage limit or switching to another subscription, I want
 one command that clears the host queue's `paused_until` and re-arms every run parked `RATE_LIMITED`,
 so that dispatch resumes the moment I say so instead of at the persisted reset time or the next
@@ -318,6 +324,7 @@ What gets built first, how much a job may cost, and where to look.
 #### Stories
 
 ##### Story 32.3-001: Priority classes, per-job budgets, and cross-job overlap within a repo
+**Status**: Done
 **User Story**: As FX, I want jobs ordered by priority class (P0 and bugs before features, as batch
 `fix all` already orders), each job to carry per-class budgets (fix rounds, wall-clock cap), and jobs in
 the same repo that touch overlapping files to serialise automatically, so that the queue makes the same
@@ -353,6 +360,7 @@ the scheduler reading the run's ledger (`stage_breakdown`), not by touching the 
 **Risk Level**: Medium
 
 ##### Story 32.3-002: Queue panel on the dashboard
+**Status**: Done
 **User Story**: As FX glancing at the dashboard, I want a queue panel — jobs by state and repo, the
 current pause reason if any, parked jobs with their PR links, slot usage, and each job's controller
 version check — so that "what will run next and why isn't it running" is answerable in one look.

@@ -1,6 +1,6 @@
 # Epic 19: Controller UX & Ergonomics
 
-> **Status: IN PROGRESS (3/4)** — 19.2-003 added 2026-09-07 (sidebar status filter,
+> **Status: COMPLETE (4/4)** — 19.2-003 merged 2026-09-07 (#661; Done marker backfilled 2026-10-29); 19.2-003 added 2026-09-07 (sidebar status filter,
 > not yet built). The original three merged on `main` (2026-06-25, parallel
 > run 1ac839c4): multi-epic build scope 19.1-001 (#193), dashboard sidebar
 > active-vs-finished 19.2-001 (#192), live per-story parallel progress 19.2-002
@@ -195,6 +195,7 @@ beyond confirming the bar width derives from live `done/total`.
 finalize and not regress serial mode. No `.sh`/`.github` (no high-risk gate).
 
 ##### Story 19.2-003: Dashboard sidebar — filter runs by status
+**Status**: Done
 
 **User Story**: As someone watching the dashboard with runs from several repos
 listed, I want to filter the left RUNS sidebar by status — any combination of
