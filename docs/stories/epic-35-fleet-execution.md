@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: COMPLETE (36/36)** — 35.2-010 and 35.5-010 merged 2026-10-28..29 (jobs 46 and 45, #926/#925, v2.122.0+); 35.5-010 (reconcile on a worker leaves its clone clean) added 2026-10-28 from job 44's `DIRTY_WORKING_TREE` hold; 35.5-007, 35.5-008 and 35.5-009 merged 2026-10-28 (job 44, #920/#919/#921, v2.119.0–v2.121.0); 35.5-007 (a bugfix that only re-ran CI re-checks the merge gate), 35.5-008 (reconcile from an SSH shell reaches the fleet queue) and 35.5-009 (controller tests pass inside an agent worktree) added 2026-10-28 from fleet job 43; 35.2-013 and 35.2-014 merged 2026-10-28 (job 43, #910/#911, v2.117.0/v2.118.0); 35.2-013 (a failed worker self-check names the real error) and 35.2-014 (doctor warns when a Mac worker's Keychain can lock) added 2026-10-28 from the home-lab worker going offline after the v2.116.0 deploy; 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (36/38)** — 35.1-005 (a broken `tailscale whois` reads as unavailable, issue #833) and 35.5-011 (`sdlc fix` runs in its own worktree, issue #799) added 2026-10-29; 35.2-010 and 35.5-010 merged 2026-10-28..29 (jobs 46 and 45, #926/#925, v2.122.0+); 35.5-010 (reconcile on a worker leaves its clone clean) added 2026-10-28 from job 44's `DIRTY_WORKING_TREE` hold; 35.5-007, 35.5-008 and 35.5-009 merged 2026-10-28 (job 44, #920/#919/#921, v2.119.0–v2.121.0); 35.5-007 (a bugfix that only re-ran CI re-checks the merge gate), 35.5-008 (reconcile from an SSH shell reaches the fleet queue) and 35.5-009 (controller tests pass inside an agent worktree) added 2026-10-28 from fleet job 43; 35.2-013 and 35.2-014 merged 2026-10-28 (job 43, #910/#911, v2.117.0/v2.118.0); 35.2-013 (a failed worker self-check names the real error) and 35.2-014 (doctor warns when a Mac worker's Keychain can lock) added 2026-10-28 from the home-lab worker going offline after the v2.116.0 deploy; 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 36 | **Total Points**: 117 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 38 | **Total Points**: 122 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -233,6 +233,53 @@ which was lost with the story worktree.
 - [ ] Tests: a regression test asserting the server's backlog is at least the
       concurrency the suite uses; the concurrent-claims test is stable in a
       repeated run on macOS
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.1-001
+**Risk Level**: Low
+
+##### Story 35.1-005: A broken `tailscale whois` is reported as unavailable, not as a peer with no identity
+**User Story**: As FX, I want the queue service to say "identity unavailable"
+with the Tailscale CLI's own message when `tailscale whois` can't answer, so
+that a broken lookup on the serving host is never logged as the peer's fault.
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** `tailscale whois --json <ip>` exits 0 with empty or non-JSON
+  stdout (the app-bundle CLI under launchd prints `The Tailscale GUI failed
+  to start: … (Tailscale.CLIError error 3.)` and exits 0) **When** a peer
+  without a token calls the service **Then** the request is refused as
+  `identity unavailable: <the CLI's first line>`, never as `peer has no
+  Tailscale identity`.
+- **Given** valid JSON with no `UserProfile.LoginName` **When** the peer calls
+  **Then** it is still refused as `peer has no Tailscale identity` (today's
+  behaviour for a genuinely unidentified peer).
+- **Given** a peer presenting a valid `SDLC_QUEUE_TOKEN` **When** whois is
+  broken **Then** it is still let in; the token gate comes first, unchanged.
+- **Given** `sdlc doctor` on a host whose installed queue agent has an
+  identity allowlist **When** `tailscale whois` against the host's own
+  tailnet address fails the same way **Then** doctor warns, quotes the CLI's
+  message, and suggests `SDLC_QUEUE_TOKEN` as the supported path on a Mac
+  running the Tailscale GUI app.
+
+**Technical Notes**: Issue #833, from the Epic-35 bring-up on home-lab
+(2026-10-04). `tailscale_whois` (`queue_server.py:134`) returns `None` on
+`ValueError`/`KeyError`/`TypeError` from `json.loads(proc.stdout)`, so an
+empty stdout becomes "no identity" in `AccessPolicy` (`queue_server.py:237`).
+Split the cases: a JSON parse failure raises `WhoisUnavailable` (with the
+stdout's first line, else stderr), while a parsed payload without a login
+stays `None`. The fleet has run on `SDLC_QUEUE_TOKEN` since that day, so this
+is about honest logs and an early doctor warning, not a new access path.
+Document the GUI-app limitation beside the identity gate in
+`docs/controller-architecture.md`.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: empty stdout + exit 0 → `WhoisUnavailable` with the message;
+      JSON without a login → `None`; token wins over a broken whois; doctor
+      WARN on a failing self-lookup, nothing when it succeeds or no allowlist
+      is configured
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.1-001
@@ -1788,6 +1835,59 @@ local edit by hand.
 
 **Dependencies**: 35.5-006
 **Risk Level**: Low
+
+##### Story 35.5-011: `sdlc fix` runs in its own worktree and never touches the checkout
+**User Story**: As FX, I want `sdlc fix` to run each issue in an isolated
+worktree as `sdlc build` does, so that a fix never switches the branch of my
+checkout or a worker's clone, and its draft commits never leak into my
+branches.
+**Priority**: Must Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a repo whose checkout is on another branch with uncommitted
+  changes **When** `sdlc fix <n>` runs (single issue, or a batch with one
+  worker) **Then** the fix works in `.claude/worktrees/agent-<run>-issue-<n>`
+  on `feature/issue-<n>`, and afterwards the checkout's HEAD, branch, index
+  and `git status` are unchanged.
+- **Given** a fix and a build running at the same time in one repo **When**
+  both commit **Then** neither run's commits appear on the other's branches.
+- **Given** a fix that ends (merged, failed or parked) **When** the run closes
+  **Then** the worktree is torn down as a build's is and the branch/PR are
+  kept; a parked fix keeps its worktree for `sdlc resume`.
+- **Given** the checkout is dirty **When** `sdlc fix` starts **Then** it no
+  longer refuses for that reason (the #590 guard exists only because the fix
+  used the checkout); a fix enqueued on a fleet worker no longer needs a clean
+  clone beyond the worker's own sync check.
+- **Given** a worktree cannot be created **When** `sdlc fix` starts **Then**
+  it refuses with the reason rather than falling back to the checkout.
+
+**Technical Notes**: Issue #799 (agentic-coding-monitor, 2026-10-01: a fix
+run's draft commits were carried into an unrelated docs MR and local `main`
+was pulled/reset under the user). On this repo, an interrupted `sdlc fix 901`
+(2026-10-28) left the checkout on an empty `feature/issue-901`.
+- `run_fix` (`fix_issue.py:2210`) states "A fix run never cuts a worktree"
+  (around `fix_issue.py:2289`) and guards a dirty root instead (#590).
+- `run_fix_batch` already isolates each issue with `create_story_worktree`
+  when `workers > 1` (around `fix_issue.py:3429`), but falls back to the
+  repo root on `WorktreeError`. Use the same path for every real fix and drop
+  the fallback.
+- The fix agents' prompts open with `git checkout -b`; they must run with
+  `cwd` set to the worktree, as `functools.partial(dispatch, cwd=workdir)`
+  already does in the batch path.
+- `sdlc resume` of a fix run must find the worktree from the ledger
+  (`set_story_worktree`).
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: fixture repo on another branch with uncommitted changes, fix
+      run → checkout unchanged; concurrent fix + build → no cross-commits;
+      worktree failure → refusal, no checkout use; parked fix → worktree kept
+      and resumed
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: None
+**Risk Level**: Medium
 
 ## Epic Sequencing
 
