@@ -21,6 +21,7 @@ from sdlc.queue_server import (
     TAILNET_NETWORKS,
     AccessPolicy,
     BindError,
+    Decision,
     WhoisUnavailable,
     make_server,
     parse_bind,
@@ -858,10 +859,58 @@ def test_tailscale_whois_returns_the_login_name(monkeypatch) -> None:
     assert tailscale_whois("100.64.0.1") == "fx@example.com"
 
 
-@pytest.mark.parametrize("stdout", ["not json", "{}", '{"UserProfile": null}', '{"UserProfile": {"LoginName": ""}}'])
+@pytest.mark.parametrize("stdout", ["{}", "[]", "null", '{"UserProfile": null}', '{"UserProfile": {"LoginName": ""}}'])
 def test_tailscale_whois_without_a_login_is_none(monkeypatch, stdout) -> None:
     _fake_run(monkeypatch, _Proc(stdout=stdout))
     assert tailscale_whois("100.64.0.1") is None
+
+
+# Issue #833: the app-bundle CLI under launchd prints this and exits 0.
+_GUI_FAILURE = (
+    "The Tailscale GUI failed to start: The operation couldn't be completed. "
+    "(Tailscale.CLIError error 3.)"
+)
+
+
+@pytest.mark.parametrize(
+    ("proc", "message"),
+    [
+        (_Proc(stdout=f"{_GUI_FAILURE}\nmore detail\n"), _GUI_FAILURE),
+        (_Proc(stdout="\n", stderr=f"{_GUI_FAILURE}\n"), _GUI_FAILURE),
+        (_Proc(stdout="not json"), "not json"),
+    ],
+)
+def test_tailscale_whois_unparseable_output_is_unavailable(monkeypatch, proc, message) -> None:
+    _fake_run(monkeypatch, proc)
+    with pytest.raises(WhoisUnavailable) as caught:
+        tailscale_whois("100.64.0.1")
+    assert str(caught.value) == message
+
+
+def test_tailscale_whois_silent_success_is_unavailable(monkeypatch) -> None:
+    _fake_run(monkeypatch, _Proc(stdout="", stderr=""))
+    with pytest.raises(WhoisUnavailable, match="no JSON"):
+        tailscale_whois("100.64.0.1")
+
+
+def test_policy_reports_a_broken_whois_as_unavailable_not_as_no_identity(monkeypatch) -> None:
+    _fake_run(monkeypatch, _Proc(stdout=f"{_GUI_FAILURE}\n"))
+    decision = AccessPolicy(allow=["fx@example.com"], networks=LOOPBACK).authorize("127.0.0.1", None)
+    assert not decision.allowed
+    assert decision.detail == f"identity unavailable: {_GUI_FAILURE}"
+
+
+def test_policy_still_reports_a_parsed_payload_without_login_as_no_identity(monkeypatch) -> None:
+    _fake_run(monkeypatch, _Proc(stdout='{"Node": {"Name": "tagged"}}'))
+    decision = AccessPolicy(allow=["fx@example.com"], networks=LOOPBACK).authorize("127.0.0.1", None)
+    assert decision == Decision(False, "peer has no Tailscale identity")
+
+
+def test_token_wins_over_a_broken_whois(monkeypatch) -> None:
+    _fake_run(monkeypatch, _Proc(stdout=f"{_GUI_FAILURE}\n"))
+    policy = AccessPolicy(allow=["fx@example.com"], token="s3cret", networks=LOOPBACK)
+    assert policy.authorize("127.0.0.1", "s3cret") == Decision(True, "token")
+    assert policy.authorize("127.0.0.1", None).detail.startswith("identity unavailable:")
 
 
 @pytest.mark.parametrize("failure", [OSError("no tailscale"), _Proc(returncode=1, stderr="down")])
