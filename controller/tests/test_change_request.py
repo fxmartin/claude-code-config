@@ -170,6 +170,82 @@ def test_github_cr_status_none_when_no_checks() -> None:
     assert ih.GitHubAdapter(runner=runner).cr_status("123") == ih.CR_NONE
 
 
+# --- superseded check runs (story 35.2-010) ----------------------------------
+# The Risk Gate re-fires as a *new* workflow run on `labeled`, so the head commit
+# carries the red pre-approval run beside the green post-approval one and
+# statusCheckRollup returns both. PR #926: FX added `risk-approved`, GitHub read
+# the PR as CLEAN, but the controller folded in the stale red run and blocked.
+
+
+def _gate_run(conclusion: str | None, started: str, status: str = "COMPLETED") -> dict:
+    return {
+        "__typename": "CheckRun", "name": "High-risk file approval gate",
+        "workflowName": "Risk Gate", "status": status,
+        "conclusion": conclusion, "startedAt": started,
+    }
+
+
+_CI_GREEN = {
+    "__typename": "CheckRun", "name": "Static checks", "workflowName": "CI",
+    "status": "COMPLETED", "conclusion": "SUCCESS",
+    "startedAt": "2026-10-28T21:45:44Z",
+}
+
+
+def test_github_cr_status_ignores_superseded_failed_run() -> None:
+    rollup = json.dumps({"statusCheckRollup": [
+        _gate_run("FAILURE", "2026-10-28T21:45:44Z"),
+        _CI_GREEN,
+        _gate_run("SUCCESS", "2026-10-29T08:39:37Z"),
+    ]})
+    runner = FakeRunner({"pr view": (0, rollup, "")})
+    assert ih.GitHubAdapter(runner=runner).cr_status("926") == ih.CR_SUCCESS
+
+
+def test_github_cr_status_newer_failed_run_supersedes_older_success() -> None:
+    rollup = [
+        _gate_run("SUCCESS", "2026-10-28T21:45:44Z"),
+        _gate_run("FAILURE", "2026-10-29T08:39:37Z"),
+    ]
+    assert ih._github_rollup_status(rollup) == ih.CR_FAILED
+
+
+def test_github_cr_status_inflight_rerun_supersedes_completed_run() -> None:
+    # A queued re-run carries the zero `startedAt` gh emits for a null time; it
+    # is still the newest run, so the gate keeps polling instead of failing.
+    rollup = [
+        _gate_run("FAILURE", "2026-10-28T21:45:44Z"),
+        _gate_run(None, "0001-01-01T00:00:00Z", status="QUEUED"),
+    ]
+    assert ih._github_rollup_status(rollup) == ih.CR_PENDING
+
+
+def test_github_cr_status_same_job_name_in_other_workflow_is_not_superseded() -> None:
+    rollup = [
+        {**_CI_GREEN, "name": "lint", "workflowName": "Docs",
+         "conclusion": "FAILURE"},
+        {**_CI_GREEN, "name": "lint", "startedAt": "2026-10-29T08:39:37Z"},
+    ]
+    assert ih._github_rollup_status(rollup) == ih.CR_FAILED
+
+
+def test_github_cr_checks_drops_superseded_gate_run() -> None:
+    payload = json.dumps({
+        "labels": [{"name": "risk:high"}, {"name": "risk-approved"}],
+        "statusCheckRollup": [
+            _gate_run("FAILURE", "2026-10-28T21:45:44Z"),
+            _CI_GREEN,
+            _gate_run("SUCCESS", "2026-10-29T08:39:37Z"),
+        ],
+    })
+    runner = FakeRunner({"pr view": (0, payload, "")})
+    view = ih.GitHubAdapter(runner=runner).cr_checks("926")
+    assert view.checks == (
+        ("High-risk file approval gate", ih.CR_SUCCESS),
+        ("Static checks", ih.CR_SUCCESS),
+    )
+
+
 def test_github_cr_merge() -> None:
     runner = FakeRunner({"pr merge": (0, "", "")})
     cr = ih.GitHubAdapter(runner=runner).cr_merge("123")
