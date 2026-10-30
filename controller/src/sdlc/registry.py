@@ -119,6 +119,9 @@ class RunRecord:
     # ``closing``; None for a finished run or one a registry from before this
     # field wrote. The fleet view shows it beside the worker.
     phase: str | None = None
+    # The controller version the run started on (issue #944), so `sdlc doctor` can
+    # name a live run an install has moved past. None on a record from before it.
+    controller_version: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -428,6 +431,19 @@ class Registry:
                 continue
             return record
         return None
+
+    def active_sdlc_runs(self, *, exclude_pid: int | None = None) -> list[RunRecord]:
+        """Every unfinished run on this host whose pid still answers.
+
+        The runs a controller reinstall would swap the environment under (issue
+        #944). ``exclude_pid`` defaults to this process: a caller is never in its
+        own way.
+        """
+        own = os.getpid() if exclude_pid is None else exclude_pid
+        return [
+            record for record in self.records()
+            if record.pid != own and not record.finished_at and pid_alive(record.pid)
+        ]
 
     def view(self) -> list[dict]:
         """Records as dicts annotated with the derived effective ``state``."""

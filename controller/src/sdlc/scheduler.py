@@ -1050,6 +1050,9 @@ class _Scheduler:
         # Repos whose self-update was deferred because a sibling job was still
         # in flight; retried once the last one is reaped.
         self._pending_self_update: set[str] = set()
+        # The other host runs last named as holding a self-update, so a deferral
+        # retried on every poll is announced once.
+        self._self_update_blockers: list[str] = []
         self._in_flight: dict[int, _InFlight] = {}
         self._result = SchedulerResult()
         self._poll_interval = approval_poll_interval(config.approval_poll_seconds)
@@ -1781,6 +1784,17 @@ class _Scheduler:
             # meets the guard meanwhile parks with the marker and is requeued.
             self._pending_self_update.add(repo)
             return False
+        # Issue #944: so would a direct `sdlc build`/`fix`/`resume`, or another
+        # worker's job, anywhere on this host. Same deferral: `_reap` retries.
+        others = sorted(run.run_id for run in self._registry.active_sdlc_runs())
+        if others:
+            self._pending_self_update.add(repo)
+            if others != self._self_update_blockers:
+                self._echo(f"self-update deferred: sdlc runs active on this host: "
+                           f"{', '.join(others)}")
+            self._self_update_blockers = others
+            return False
+        self._self_update_blockers = []
         self._pending_self_update.discard(repo)
         installed = self._self_updater(Path(repo), self._installed_version)
         if installed is None:

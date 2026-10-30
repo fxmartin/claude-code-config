@@ -35,6 +35,7 @@ shells out to `sdlc build $ARGUMENTS`.
 | `sdlc/model_backfill.py` | Per-stage model attribution — backfills historical `stages.model` NULLs from the session transcripts' `modelUsage` and scores model coverage for `sdlc doctor` (Story 28.1-002). |
 | `sdlc/predictor.py` | Per-story cost + rework predictor — a crude, inspectable model (cohort means keyed on the discovery features, nudged by them) trained on the ledger's own reconciled history, plus the prediction-quality metrics (Story 28.2-002). |
 | `sdlc/registry.py` | Host-level run registry — a cross-repo discovery cache for `sdlc runs`/dashboard (Story 11.2-001). |
+| `sdlc/install_guard.py` | Parks a direct run's stories `NEEDS_ATTENTION` when the controller is reinstalled under it: eager imports at start, an install marker checked at stage boundaries (issue #944). |
 | `sdlc/queue.py` | Host-level development queue — SQLite/WAL job store `sdlc build/fix --enqueue` write to and `sdlc queue list\|add\|cancel\|requeue\|prioritise\|unpause` manage (Story 32.1-001); also holds the approval park (`parked`, `pr_number`, `poll_after` — Story 32.2-002), the one host-level rate-limit pause every repo shares (Story 32.2-001), and the queue's pure policy: priority classes, per-class budgets, and repo-scoped file-overlap serialisation (Story 32.3-001). |
 | `sdlc/scheduler.py` | The `sdlc queue run` drain loop — leased claims over `queue.py`, per-repo exclusivity, a host-wide agent-slot cap, reclaim-and-resume for a killed scheduler (Story 32.1-002), the approval park + auto-resume (Story 32.2-002), one shared rate-limit window discovered and waited out once (Story 32.2-001), and the per-job budget breaker (Story 32.3-001). |
 | `sdlc/queue_client.py` | `QueueClient` (the `QueueBackend` verbs over HTTP), the `SDLC_QUEUE_URL` / `.sdlc-queue.yaml` / `~/.sdlc-fleet.yaml` switch and the `open_queue()` factory every queue consumer opens its store through (Story 35.1-002). |
@@ -1613,7 +1614,9 @@ announces itself in a host-level **registry** (`sdlc/registry.py`).
   (`os.kill(pid, 0)`), so it does not linger as in-progress forever.
   `Registry.prune` drops `DEAD` entries (and, optionally, finished ones).
 - **`sdlc runs`** lists the registry view (repo, scope, derived state, progress);
-  `--json` emits it for tooling and `--prune` clears crashed entries first.
+  `--json` emits it for tooling and `--prune` clears crashed entries first;
+  `--active` prints only live, unfinished runs, which `scripts/deploy.sh` reads
+  before it reinstalls the controller (issue #944).
 
 ## The queue scheduler (`sdlc queue run`, Story 32.1-002)
 

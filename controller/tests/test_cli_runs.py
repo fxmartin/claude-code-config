@@ -113,3 +113,29 @@ def test_runs_json_shows_live_ledger_progress(tmp_path, monkeypatch):
     result = runner.invoke(app, ["runs", "--json"])
     row = json.loads(result.output)[0]
     assert (row["completed"], row["total"]) == (3, 8)
+
+
+def test_runs_active_lists_only_live_unfinished_runs(tmp_path, monkeypatch):
+    """Issue #944: what scripts/deploy.sh reads before it reinstalls."""
+    path = tmp_path / "registry.json"
+    monkeypatch.setenv("SDLC_REGISTRY_PATH", str(path))
+    reg = Registry(path)
+    reg.register(RunRecord(run_id="live-run", repo="/r", db="/r/l.db", scope="1.1-001",
+                           pid=os.getppid(), status="IN_PROGRESS", started_at="t"))
+    reg.register(RunRecord(run_id="done-run", repo="/r", db="/r/l.db", scope="1.1-002",
+                           pid=os.getppid(), status="IN_PROGRESS", started_at="t"))
+    reg.mark_finished("done-run", "DONE")
+
+    result = runner.invoke(app, ["runs", "--active"])
+
+    assert result.exit_code == 0
+    assert result.output.split() == ["live-run", "1.1-001", "pid", str(os.getppid()), "/r"]
+
+
+def test_runs_active_is_silent_with_nothing_live(tmp_path, monkeypatch):
+    monkeypatch.setenv("SDLC_REGISTRY_PATH", str(tmp_path / "registry.json"))
+
+    result = runner.invoke(app, ["runs", "--active"])
+
+    assert result.exit_code == 0
+    assert result.output == ""

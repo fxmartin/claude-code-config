@@ -39,7 +39,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-from sdlc import build_issue, change_class, issue_host, teardown
+from sdlc import build_issue, change_class, install_guard, issue_host, teardown
 from sdlc.build import (
     _GATE_BLOCK,
     MAX_BUGFIX_ATTEMPTS,
@@ -1695,6 +1695,26 @@ def _recover_fix_plan(ledger: Ledger, run_id: str) -> dict | None:
     return None
 
 
+def _parks_on_reinstall(stage_loop):
+    """Park a fix whose imports the controller's swap broke, not fail it (issue #944)."""
+
+    @functools.wraps(stage_loop)
+    def wrapper(issue, inv, story, opts, ledger, run_id, *args, **kwargs):
+        try:
+            return stage_loop(issue, inv, story, opts, ledger, run_id, *args, **kwargs)
+        except ImportError as exc:
+            if not install_guard.is_reinstall_crash(exc):
+                raise
+            ledger.event_log(
+                run_id, story.id, "warn", "controller",
+                install_guard.REINSTALL_PARK_MESSAGE,
+            )
+            return "NEEDS_ATTENTION", kwargs.get("pr_number")
+
+    return wrapper
+
+
+@_parks_on_reinstall
 def _run_stage_loop(
     issue: FixIssue,
     inv: dict,
@@ -1764,6 +1784,13 @@ def _run_stage_loop(
     story_class: str | None = None
 
     for stage in stages:
+        # Issue #944: never start a stage on a controller swapped out underneath.
+        if install_guard.reinstalled():
+            ledger.event_log(
+                run_id, story.id, "warn", "controller",
+                install_guard.REINSTALL_PARK_MESSAGE,
+            )
+            return "NEEDS_ATTENTION", pr_number
         # Story 27.2-003: classify once, post-build, when the first gated stage is
         # reached (coverage, or review when coverage was skipped/absent).
         if stage in ("coverage", "review") and story_class is None:
@@ -2263,6 +2290,7 @@ def run_fix(
     refuses the run (closed ABORTED with the reason); it never falls back to the
     checkout. An injected dispatcher launches no agent, so it gets no worktree.
     """
+    install_guard.arm()
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
     if registry is None and dispatcher is None:
@@ -2631,6 +2659,7 @@ def resume_fix(
     issue closed, labelled wontfix or reassigned since stops the resume, and an
     interrupted run is closed ABORTED.
     """
+    install_guard.arm()
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
     if registry is None and dispatcher is None:
@@ -3342,6 +3371,7 @@ def run_fix_batch(
     carries the same Issue #545 registration and would otherwise be just as
     invisible to the dashboard.
     """
+    install_guard.arm()
     dispatch = dispatcher or dispatch_agent
     runner = runner or _default_runner
     real_run = dispatcher is None

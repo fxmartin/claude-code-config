@@ -26,9 +26,11 @@ from sdlc.capability import (
     probe_rate_limit,
     resolve_capabilities,
 )
+from sdlc import __version__
 from sdlc import build_issue
 from sdlc import change_class
 from sdlc import coverage_precheck
+from sdlc import install_guard
 from sdlc import teardown
 from sdlc.degradation import evaluate_degradations
 from sdlc.cohort import Story, compute_cohorts, truncate_queue
@@ -1953,6 +1955,28 @@ def _run_story_rate_limited(
         )
     _reconcile_story_prediction(ledger, run_id, story.id)
     return _StoryRunOutcome(status=status, waited_s=waited_total)
+
+
+def _park_on_reinstall(
+    ledger: Ledger, run_id: str, story_id: str, drive: Callable[[], _StoryRunOutcome]
+) -> _StoryRunOutcome:
+    """Run ``drive``, or park the story if the controller was replaced (issue #944).
+
+    Shared by build and resume, serial and parallel. A story not yet started
+    parks here without a worktree; an import the swap broke parks rather than
+    reaching the callers' failure isolation as ``FAILED``, which `sdlc resume`
+    could not tell from a real story failure.
+    """
+    if not install_guard.reinstalled():
+        try:
+            return drive()
+        except ImportError as exc:
+            if not install_guard.is_reinstall_crash(exc):
+                raise
+    ledger.event_log(
+        run_id, story_id, "warn", "controller", install_guard.REINSTALL_PARK_MESSAGE,
+    )
+    return _StoryRunOutcome(status="NEEDS_ATTENTION")
 
 
 # ---------------------------------------------------------------------------
@@ -7885,6 +7909,7 @@ def _registry_register(
             # worker forwards the record on its start, beat and exit writes, and
             # one draining its own host's store hands its jobs no fleet to push to.
             origin=_repo_origin(root),
+            controller_version=__version__,
         )
         registry.register(record)
     except OSError:
@@ -8167,6 +8192,7 @@ def run_build(
     It defaults to :func:`default_rate_limit_probe` only on a *real* run; an
     injected dispatcher gets no probe, so tests never shell out.
     """
+    install_guard.arm()
     resolve_predict(opts, (root or Path.cwd()) / MODEL_ROUTING_OVERRIDE_FILENAME)
     dispatch = _resolve_dispatch(dispatcher, opts, dispatch_agent)
     preflight_failures: list[str] = []
@@ -8505,21 +8531,24 @@ def run_build(
     # and parallel paths so the two can never diverge in how a story is run — only
     # in how many run at once.
     def _run_one(story: Story) -> _StoryRunOutcome:
-        # Story 17.2-001: isolate a real parallel story in its own git worktree so
-        # concurrent agents never collide in the shared checkout (None reuses the
-        # root for --sequential / fakes / on creation failure).
-        workdir = _prepare_story_workdir(
-            opts, story, ledger, run_id, real_run=dispatcher is None
-        )
-        # Issue #607: bracket the story so an agent that escapes its worktree
-        # into the operator's checkout is caught at close-out (see
-        # :func:`guard_primary_checkout`).
-        return guard_primary_checkout(
-            ledger, run_id, story.id, workdir,
-            lambda: _run_story_rate_limited(
-                rl_ctx, story, ledger, run_id, dispatch, logs_dir, workdir=workdir,
-            ),
-        )
+        def _drive() -> _StoryRunOutcome:
+            # Story 17.2-001: isolate a real parallel story in its own git worktree
+            # so concurrent agents never collide in the shared checkout (None
+            # reuses the root for --sequential / fakes / on creation failure).
+            workdir = _prepare_story_workdir(
+                opts, story, ledger, run_id, real_run=dispatcher is None
+            )
+            # Issue #607: bracket the story so an agent that escapes its worktree
+            # into the operator's checkout is caught at close-out (see
+            # :func:`guard_primary_checkout`).
+            return guard_primary_checkout(
+                ledger, run_id, story.id, workdir,
+                lambda: _run_story_rate_limited(
+                    rl_ctx, story, ledger, run_id, dispatch, logs_dir, workdir=workdir,
+                ),
+            )
+
+        return _park_on_reinstall(ledger, run_id, story.id, _drive)
 
     # Story 19.2-002: credit a parallel story's terminal status the instant its
     # worker finishes — before the scheduler applies the outcome — so
@@ -9289,6 +9318,13 @@ def _run_story(
     # dispatch reports them — the packet then names the gap.
     coverage_signals: str | None = None
     for idx, stage in enumerate(pending):
+        # Issue #944: never start a stage on a controller swapped out underneath.
+        if install_guard.reinstalled():
+            ledger.event_log(
+                run_id, story.id, "warn", "controller",
+                install_guard.REINSTALL_PARK_MESSAGE,
+            )
+            return "NEEDS_ATTENTION"
         # Story 22.4-002: post a live status comment/label on the story's issue as
         # the build enters each stage (building → in-review → merging). Deduped
         # against the previous stage so build→coverage (both "building") is silent.
