@@ -426,6 +426,7 @@ class QueueClient:
         forges: Mapping[str, bool] | None = None,
         now: datetime | None = None,
         self_check: Mapping[str, object] | None = None,
+        platform: str | None = None,
     ) -> WorkerRecord:
         """``POST /workers`` — register this worker, or heartbeat if it already has."""
         body: dict[str, Any] = {
@@ -444,6 +445,8 @@ class QueueClient:
             body["forges"] = dict(forges)
         if self_check is not None:
             body["self_check"] = dict(self_check)
+        if platform:
+            body["platform"] = platform
         return self._worker(self._call("POST", "/workers", body))
 
     def list_workers(self) -> list[WorkerRecord]:

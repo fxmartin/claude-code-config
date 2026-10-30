@@ -596,7 +596,8 @@ CREATE TABLE IF NOT EXISTS workers (
     registered_at  TIMESTAMP NOT NULL,
     last_heartbeat TIMESTAMP NOT NULL,
     self_check     TEXT,
-    forges         TEXT NOT NULL DEFAULT '{}'
+    forges         TEXT NOT NULL DEFAULT '{}',
+    platform       TEXT
 );
 """
 
@@ -760,6 +761,9 @@ _MIGRATIONS: list[tuple[int, str, str, list[tuple[str, str]], str | None]] = [
     (17, "job_issues", "jobs", [("issues", "TEXT")], None),
     # Story 35.5-005: the worker a parked job waits for.
     (18, "job_parked_by", "jobs", [("parked_by", "TEXT")], None),
+    # Story 35.2-015: the OS a worker runs on (`darwin`, `linux`), matched against a
+    # repo's declared `platforms`. NULL — a worker that predates it — runs anything.
+    (19, "worker_platform", "workers", [("platform", "TEXT")], None),
 ]
 
 
@@ -873,6 +877,9 @@ class WorkerRecord:
     # Story 35.2-007: `{ok, at, reason}` from the worker's own agent probe; ``None``
     # for a worker that predates it (or never reported), which is not a failure.
     self_check: dict | None = None
+    # Story 35.2-015: ``platform.system().lower()`` on the worker; ``None`` for one that
+    # never reported it, which the matcher reads as "may run any platform's job".
+    platform: str | None = None
 
     @property
     def can_run_agents(self) -> bool:
@@ -963,6 +970,10 @@ def _in_pool(pool: str) -> _Check:
     return lambda worker: pool in worker.pools
 
 
+def _on_platform(platforms: Sequence[str]) -> _Check:
+    return lambda worker: worker.platform is None or worker.platform in platforms
+
+
 def _has_sandbox(runtime: str | None) -> _Check:
     """Any container runtime (``None``), or exactly the named one."""
     if runtime is None:
@@ -978,7 +989,9 @@ def job_needs(job: JobRecord) -> list[_Need]:
     ``pool P``. A job that routes any stage to ``codex`` (``harness`` may list
     several, ``claude,codex``) also needs the :data:`CODEX_POOL`. A job that
     records its ``origin`` does not need a worker that already has the clone:
-    the worker clones it from there before dispatch (Story 35.2-002).
+    the worker clones it from there before dispatch (Story 35.2-002). A job whose
+    repo declares ``platforms`` needs a worker on one of them, ``platform linux``
+    (Story 35.2-015); a worker that never reported its platform may run it.
     """
     needs: list[_Need] = []
     if job.host:
@@ -992,6 +1005,11 @@ def job_needs(job: JobRecord) -> list[_Need]:
     harnesses = _csv(requirements.get("harness"))
     for harness in harnesses:
         needs.append((f"harness {harness}", _has_harness(harness)))
+    # Lower-cased like `sandbox`: workers register theirs lower-cased, and a job
+    # posted straight to the service never went through the CLI's loader.
+    platforms = _csv(requirements.get("platform", "").lower())
+    if platforms:
+        needs.append((f"platform {' or '.join(platforms)}", _on_platform(platforms)))
     sandbox = requirements.get("sandbox", "").strip().lower()
     if sandbox not in _SANDBOX_NOT_NEEDED:
         if sandbox in _SANDBOX_ANY:
@@ -1265,6 +1283,7 @@ class QueueBackend(Protocol):
         forges: Mapping[str, bool] | None = None,
         now: datetime | None = None,
         self_check: Mapping[str, object] | None = None,
+        platform: str | None = None,
     ) -> WorkerRecord: ...
 
     def list_workers(self) -> list[WorkerRecord]: ...
@@ -1994,6 +2013,7 @@ class QueueStore:
         forges: Mapping[str, bool] | None = None,
         now: datetime | None = None,
         self_check: Mapping[str, object] | None = None,
+        platform: str | None = None,
     ) -> WorkerRecord:
         """Record (or refresh) a worker's capabilities — registration *is* the heartbeat.
 
@@ -2011,6 +2031,9 @@ class QueueStore:
         ``forges`` (Story 35.2-006) is ``{forge host: its CLI can authenticate git
         there non-interactively}``; a job whose origin is on a host reported False
         is never matched to the worker, and a host it never reported may be tried.
+
+        ``platform`` (Story 35.2-015) is the worker's OS, lower-cased; ``None`` leaves
+        it unreported, and such a worker may run a job for any platform.
         """
         name = name.strip()
         host = host.strip()
@@ -2022,17 +2045,19 @@ class QueueStore:
             raise QueueError(f"worker slots must be a positive integer, got {slots!r}")
         free = slots if slots_free is None else max(0, min(int(slots_free), slots))
         check = _normalise_self_check(self_check)
+        os_name = (platform or "").strip().lower() or None
         moment = _at(now).isoformat()
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO workers(name, host, pools, harnesses, sandbox, repos, slots, "
-                "slots_free, registered_at, last_heartbeat, self_check, forges) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "slots_free, registered_at, last_heartbeat, self_check, forges, platform) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(name) DO UPDATE SET host = excluded.host, pools = excluded.pools, "
                 "harnesses = excluded.harnesses, sandbox = excluded.sandbox, "
                 "repos = excluded.repos, slots = excluded.slots, "
                 "slots_free = excluded.slots_free, last_heartbeat = excluded.last_heartbeat, "
-                "self_check = excluded.self_check, forges = excluded.forges",
+                "self_check = excluded.self_check, forges = excluded.forges, "
+                "platform = excluded.platform",
                 (
                     name,
                     host,
@@ -2046,6 +2071,7 @@ class QueueStore:
                     moment,
                     json.dumps(check) if check is not None else None,
                     json.dumps({str(forge): bool(ok) for forge, ok in (forges or {}).items()}),
+                    os_name,
                 ),
             )
         self.expire_offline_leases(now=now)
@@ -2827,6 +2853,7 @@ def _row_to_worker(row: sqlite3.Row) -> WorkerRecord:
         slots_free=int(row["slots_free"]),
         forges=_forges(_optional_column(row, "forges")),
         self_check=_decode_self_check(_optional_column(row, "self_check")),
+        platform=_optional_column(row, "platform"),
     )
 
 
