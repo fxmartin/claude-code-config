@@ -2722,8 +2722,9 @@ declares them beside `forge:` in its `.sdlc-forge.yaml` — `platforms: [linux]`
 — and its fleet jobs carry `requirements.platform` (comma-joined), which the
 claim matcher holds to a worker's advertised `platform`. A `--host` whose
 workers all report another platform is refused before anything is recorded,
-naming both platforms with the remedy: build locally (`sdlc build <scope>
---auto`) or pick a matching host (listed when one is registered). Unpinned, the
+naming both platforms with the remedy: run it locally (`sdlc build <scope>
+--auto`, or `sdlc fix <issue>` — `fix` has no `--auto`) or pick a matching host
+(listed when one is registered). Unpinned, the
 job is recorded even when no registered worker runs a declared platform, with a
 `warning:` saying so. The service must be upgraded before an enqueuer that sends
 the key: an older one refuses an unknown requirement with a 400. `sdlc queue list` gained

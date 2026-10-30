@@ -375,10 +375,15 @@ def _csv_values(value: str | None) -> list[str]:
 def _platform_fix_hint(
     platforms: list[str], workers: list[WorkerRecord], *, kind: str, scope: str
 ) -> str:
-    """Build it locally, or name the hosts whose workers run one of ``platforms``."""
+    """Run it locally, or name the hosts whose workers run one of ``platforms``.
+
+    Only ``sdlc build`` takes ``--auto``; ``sdlc fix`` is unattended already and
+    refuses the flag, so its local command is the bare verb and scope.
+    """
     hosts = sorted({w.host for w in workers if w.platform in platforms})
     where = f" ({', '.join(hosts)})" if hosts else ""
-    return f"build it locally (`sdlc {kind} {scope} --auto`) or pick a matching host{where}"
+    local = f"sdlc {kind} {scope}" + (" --auto" if kind == "build" else "")
+    return f"run it locally (`{local}`) or pick a matching host{where}"
 
 
 def _require_platform_host(

@@ -1005,7 +1005,9 @@ def job_needs(job: JobRecord) -> list[_Need]:
     harnesses = _csv(requirements.get("harness"))
     for harness in harnesses:
         needs.append((f"harness {harness}", _has_harness(harness)))
-    platforms = _csv(requirements.get("platform"))
+    # Lower-cased like `sandbox`: workers register theirs lower-cased, and a job
+    # posted straight to the service never went through the CLI's loader.
+    platforms = _csv(requirements.get("platform", "").lower())
     if platforms:
         needs.append((f"platform {' or '.join(platforms)}", _on_platform(platforms)))
     sandbox = requirements.get("sandbox", "").strip().lower()

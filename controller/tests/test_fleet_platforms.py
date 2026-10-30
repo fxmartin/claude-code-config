@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import subprocess
 import threading
@@ -14,6 +15,7 @@ import pytest
 from typer.testing import CliRunner
 
 from sdlc.cli import app
+from sdlc.fix_issue import parse_fix_args
 from sdlc.issue_host import IssueHostError, load_repo_platforms
 from sdlc.queue import QueueError, QueueStore
 from sdlc.queue_client import QueueClient
@@ -160,6 +162,15 @@ def test_a_multi_platform_job_runs_on_any_of_them(store) -> None:
     job_id = _job(store, "darwin,linux")
 
     claimed = store.claim_next(claimed_by="m3max", lease_seconds=90, now=T0)
+    assert claimed is not None and claimed.id == job_id
+
+
+def test_a_job_platform_is_matched_case_insensitively(store) -> None:
+    # A job posted straight to the service skips the CLI loader that lower-cases it.
+    _register(store, "xps", "linux")
+    job_id = _job(store, "Linux")
+
+    claimed = store.claim_next(claimed_by="xps", lease_seconds=90, now=T0)
     assert claimed is not None and claimed.id == job_id
 
 
@@ -314,6 +325,21 @@ def test_a_pin_to_a_mismatched_worker_is_refused_before_recording(fleet, repo) -
     assert "omarchy-xps13" in out
 
 
+@pytest.mark.parametrize("pin,exit_code", [(["--host", "m3max"], 2), ([], 0)])
+def test_a_fix_job_hints_a_local_command_fix_accepts(fleet, repo, pin, exit_code) -> None:
+    # `sdlc fix` runs unattended already and has no `--auto`; the hint must parse.
+    _linux_only(repo)
+    _client(fleet).register_worker("m3max", host="m3max", platform="darwin")
+
+    result = runner.invoke(app, ["fix", "12", "--enqueue", *pin])
+
+    assert result.exit_code == exit_code, result.output
+    out = " ".join(result.output.split())
+    hint = re.search(r"`sdlc fix ([^`]*)`", out)
+    assert hint is not None, out
+    assert parse_fix_args(hint.group(1).split()) == parse_fix_args(["12"])
+
+
 def test_a_pin_to_a_worker_without_a_platform_is_accepted(fleet, repo) -> None:
     _linux_only(repo)
     _client(fleet).register_worker("lab", host="home-lab")
@@ -358,14 +384,19 @@ def test_a_malformed_platforms_key_refuses_the_enqueue(fleet, repo) -> None:
     assert fleet.list_jobs() == []
 
 
-def test_an_unlistable_worker_roster_means_no_warning_but_still_records(fleet, repo) -> None:
+def test_an_unlistable_worker_roster_means_no_warning_but_still_records(
+    fleet, repo, monkeypatch
+) -> None:
     _linux_only(repo)
 
-    def _down() -> list:
+    def _down(self) -> list:
         raise QueueError("service unreachable")
 
-    fleet.list_workers = _down  # type: ignore[method-assign]
+    monkeypatch.setattr(QueueClient, "list_workers", _down)
 
-    from sdlc.cli import _no_platform_worker_warning
+    result = runner.invoke(app, ["build", "15.1-004", "--enqueue"])
 
-    assert _no_platform_worker_warning(fleet, ["linux"], kind="build", scope="15.1-004") is None
+    assert result.exit_code == 0, result.output
+    (job,) = fleet.list_jobs()
+    assert json.loads(job.requirements)["platform"] == "linux"
+    assert "warning" not in result.output.lower()
