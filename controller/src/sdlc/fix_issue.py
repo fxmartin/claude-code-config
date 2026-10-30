@@ -57,6 +57,8 @@ from sdlc.build import (
     render_merge_drift_block,
     _registry_finish,
     _registry_register,
+    _local_branch_sha,
+    _push_bugfix_commit,
     _run_merge_ci_gate,
     _stage_succeeded,
     _sync_branch_to_remote,
@@ -1795,6 +1797,7 @@ def _run_stage_loop(
         attempt = (start_attempts or {}).get(stage, 1)
         bugfix_attempts = 0
         regated = False  # issue #794: one merge re-gate per stage
+        pushed_bugfix_head: str | None = None  # issue #938: head the next gate must see
         # Story 27.3-003: bake the review packet once per review stage entry so
         # the dispatch and every retry reuse the same packet. None (no PR yet,
         # host failure, oversized) leaves the fetch-it-yourself fallback.
@@ -1838,7 +1841,9 @@ def _run_stage_loop(
                 gate = _run_merge_ci_gate(
                     stage, ledger, run_id, story, pr_number, opts,
                     repo_root=root or Path.cwd(),
+                    expected_sha=pushed_bugfix_head,
                 )
+                pushed_bugfix_head = None
                 if gate is not None and gate.verdict == _GATE_BLOCK:
                     ok, result, kind = False, None, "ci-gate"
                     failure = _ci_gate_failure(ledger, story, pr_number, gate.reason)
@@ -1978,6 +1983,19 @@ def _run_stage_loop(
                 return "NEEDS_ATTENTION", pr_number
             if not fixed:
                 return "FAILED", pr_number
+            if stage == "merge":
+                # Issue #938: publish the bugfix commit before the re-gate, else
+                # the gate reads the old head's pipeline and burns the budget.
+                if not _push_bugfix_commit(story, root, ledger, run_id):
+                    ledger.event_log(
+                        run_id, story.id, "warn", "controller",
+                        f"merge bugfix could not reach origin/feature/{story.id} — "
+                        "parking NEEDS_ATTENTION; commits preserved on the branch",
+                    )
+                    return "NEEDS_ATTENTION", pr_number
+                pushed_bugfix_head = _local_branch_sha(
+                    root or Path.cwd(), f"feature/{story.id}"
+                )
             attempt += 1
 
     return "DONE", pr_number

@@ -676,3 +676,48 @@ def test_gate_blocks_immediately_when_risk_gate_red_and_nothing_pending(tmp_path
     )
     assert gate.polls == 1
     assert gate.status == ih.CR_FAILED
+
+
+# --- Issue #938: the gate only accepts a pipeline for the pushed head ---------
+
+
+def test_gate_polls_past_a_stale_sha_until_the_pushed_head_pipeline(tmp_path):
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    shas = iter(["old", "old", "new"])
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: ih.CR_SUCCESS, head_sha_fn=lambda: next(shas),
+        sleep_fn=clock.sleep, clock=clock, expected_sha="new",
+    )
+    assert gate is not None
+    assert gate.verdict == _GATE_PASS
+    assert gate.polls == 3
+
+
+def test_gate_never_resolves_on_a_stale_sha_and_times_out_loudly(tmp_path):
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: ih.CR_FAILED, head_sha_fn=lambda: "oldsha",
+        sleep_fn=clock.sleep, clock=clock, expected_sha="newsha",
+    )
+    assert gate is not None
+    assert gate.verdict == _GATE_BLOCK
+    assert "no pipeline for pushed head newsha" in gate.reason
+
+
+def test_gate_without_a_reported_sha_keeps_status_only_behaviour(tmp_path):
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: ih.CR_SUCCESS, head_sha_fn=lambda: None,
+        sleep_fn=clock.sleep, clock=clock, expected_sha="newsha",
+    )
+    assert gate is not None
+    assert gate.verdict == _GATE_PASS

@@ -347,6 +347,24 @@ def change_request_status(
         return None
 
 
+def change_request_head_sha(
+    ledger: "Ledger", story_id: str, cr_ref: object, *, runner: Runner | None = None
+) -> str | None:
+    """The sha of the pipeline the CR's host reports, or None (issue #938).
+
+    Best-effort like :func:`change_request_status`: None means "not known", and
+    the merge gate then falls back to the status alone.
+    """
+    try:
+        adapter = _cr_adapter(ledger, story_id, runner)
+        if adapter is None:
+            return None
+        return adapter.cr_head_pipeline_sha(str(cr_ref))
+    except Exception:  # noqa: BLE001 — best-effort; a host hiccup never fails a build
+        log.warning("change_request_head_sha failed for %s", story_id, exc_info=True)
+        return None
+
+
 def change_request_view(
     ledger: "Ledger", story_id: str, cr_ref: object, *, runner: Runner | None = None
 ) -> ChangeRequest | None:
