@@ -730,3 +730,40 @@ def test_change_request_view_is_none_on_host_error(tmp_path, monkeypatch):
     assert bi.change_request_view(
         ledger, "10.2-001", 5, runner=FakeRunner(default=(1, "", "timeout"))
     ) is None
+
+
+def test_change_request_head_sha_reads_the_gitlab_pipeline_sha(tmp_path, monkeypatch):
+    """Issue #938: the merge gate learns which commit the pipeline ran on."""
+    ledger = _never_mirrored_gitlab(tmp_path, monkeypatch)
+    runner = FakeRunner({"mr view": (0, '{"head_pipeline": {"sha": "abc123"}}', "")})
+
+    assert bi.change_request_head_sha(ledger, "29.4-004", 5, runner=runner) == "abc123"
+
+
+def test_change_request_head_sha_is_none_without_a_pipeline(tmp_path, monkeypatch):
+    ledger = _never_mirrored_gitlab(tmp_path, monkeypatch)
+    runner = FakeRunner({"mr view": (0, '{"head_pipeline": null}', "")})
+
+    assert bi.change_request_head_sha(ledger, "29.4-004", 5, runner=runner) is None
+
+
+def test_change_request_head_sha_degrades_to_none_when_the_host_fails(
+    tmp_path, monkeypatch, caplog
+):
+    ledger = _never_mirrored_gitlab(tmp_path, monkeypatch)
+    runner = FakeRunner({"mr view": (1, "", "boom")})
+
+    with caplog.at_level("WARNING"):
+        assert bi.change_request_head_sha(ledger, "29.4-004", 5, runner=runner) is None
+    assert "change_request_head_sha failed" in caplog.text
+
+
+def test_change_request_head_sha_is_none_when_forge_will_not_resolve(tmp_path, monkeypatch):
+    ledger = _ledger(tmp_path)
+    ledger.inventory_upsert_specs([("29.4-004", "29", "29.4", "t", 3, "Should")])
+    (tmp_path / ".sdlc-forge.yaml").write_text("forge: bitbucket\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    runner = FakeRunner()
+
+    assert bi.change_request_head_sha(ledger, "29.4-004", 5, runner=runner) is None
+    assert runner.calls == []
