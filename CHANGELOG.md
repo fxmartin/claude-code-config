@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.126.1] - 2026-10-30
+
+### Fixed
+
+- fix(sdlc): push merge bugfix and gate on the pushed head (#940)
+
+
 ## [v2.126.0] - 2026-10-29
 
 ### Added
