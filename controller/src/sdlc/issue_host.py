@@ -49,6 +49,8 @@ __all__ = [
     "ForgeDeclaration",
     "ForgeResolution",
     "load_repo_forge_declaration",
+    "load_repo_platforms",
+    "SUPPORTED_PLATFORMS",
     "resolve_forge",
     "declared_instance_for",
     "format_forge_preflight_line",
@@ -441,23 +443,13 @@ class ForgeDeclaration:
     instance_url: str | None = None
 
 
-def load_repo_forge_declaration(
-    *,
-    override_path: Path | None = None,
-    override_text: str | None = None,
-) -> ForgeDeclaration | None:
-    """Load a repo's ``.sdlc-forge.yaml`` (Story 30.1-001), or None when absent.
+def _load_forge_file(
+    *, override_path: Path | None, override_text: str | None
+) -> dict | None:
+    """The parsed ``.sdlc-forge.yaml`` mapping, or None when absent or blank.
 
-    A missing file / blank text returns None — today's behaviour, so the common
-    (undeclared) repo costs one ``stat``. ``override_text`` is the inline form
-    tests use; otherwise the YAML at ``override_path`` is read when it exists.
-
-    The file is flat: a top-level ``forge:`` key (must be one of
-    :data:`SUPPORTED_HOSTS`) and an optional ``<forge>_url:`` key naming the
-    instance (e.g. ``gitlab_url: http://127.0.0.1:8080``). A present-but-malformed
-    file (bad YAML, not a mapping, a missing/unsupported ``forge:``, or a
-    malformed URL) raises :class:`IssueHostError` so a typo fails fast at
-    preflight rather than silently guessing wrong.
+    Shared by :func:`load_repo_forge_declaration` and :func:`load_repo_platforms`
+    so both keys of the one file fail the same way on a malformed file.
     """
     text = override_text
     if text is None and override_path is not None and override_path.is_file():
@@ -485,6 +477,30 @@ def load_repo_forge_declaration(
         return None
     if not isinstance(raw, dict):
         raise IssueHostError(f"{FORGE_OVERRIDE_FILENAME} must be a mapping")
+    return raw
+
+
+def load_repo_forge_declaration(
+    *,
+    override_path: Path | None = None,
+    override_text: str | None = None,
+) -> ForgeDeclaration | None:
+    """Load a repo's ``.sdlc-forge.yaml`` (Story 30.1-001), or None when absent.
+
+    A missing file / blank text returns None — today's behaviour, so the common
+    (undeclared) repo costs one ``stat``. ``override_text`` is the inline form
+    tests use; otherwise the YAML at ``override_path`` is read when it exists.
+
+    The file is flat: a top-level ``forge:`` key (must be one of
+    :data:`SUPPORTED_HOSTS`) and an optional ``<forge>_url:`` key naming the
+    instance (e.g. ``gitlab_url: http://127.0.0.1:8080``). A present-but-malformed
+    file (bad YAML, not a mapping, a missing/unsupported ``forge:``, or a
+    malformed URL) raises :class:`IssueHostError` so a typo fails fast at
+    preflight rather than silently guessing wrong.
+    """
+    raw = _load_forge_file(override_path=override_path, override_text=override_text)
+    if raw is None:
+        return None
 
     forge = raw.get("forge")
     if not isinstance(forge, str) or not forge.strip():
@@ -515,6 +531,48 @@ def load_repo_forge_declaration(
             )
 
     return ForgeDeclaration(forge=forge, instance_url=instance_url)
+
+
+# Story 35.2-015: the values a worker advertises as its platform
+# (``platform.system().lower()``) on the machines the fleet runs on.
+SUPPORTED_PLATFORMS = ("darwin", "linux")
+
+
+def load_repo_platforms(
+    *,
+    override_path: Path | None = None,
+    override_text: str | None = None,
+) -> list[str] | None:
+    """The platforms a repo's suite passes on — ``.sdlc-forge.yaml``'s ``platforms`` key.
+
+    ``platforms: [linux]`` (or a bare ``platforms: linux``) keeps the repo's fleet
+    jobs off a worker on any other platform (Story 35.2-015). None when the file
+    or the key is absent: such a repo runs anywhere, as before. Values are
+    lower-cased and de-duplicated in order; an empty list or a name outside
+    :data:`SUPPORTED_PLATFORMS` raises :class:`IssueHostError`, so a typo fails
+    the enqueue rather than strand the job on a platform no worker reports.
+    """
+    raw = _load_forge_file(override_path=override_path, override_text=override_text)
+    if raw is None or raw.get("platforms") is None:
+        return None
+    value = raw["platforms"]
+    items = [value] if isinstance(value, str) else value
+    if not isinstance(items, list) or not items or not all(
+        isinstance(item, str) and item.strip() for item in items
+    ):
+        raise IssueHostError(
+            f"{FORGE_OVERRIDE_FILENAME} 'platforms' must list one or more of: "
+            f"{', '.join(SUPPORTED_PLATFORMS)}"
+        )
+    platforms = list(dict.fromkeys(item.strip().lower() for item in items))
+    unknown = [name for name in platforms if name not in SUPPORTED_PLATFORMS]
+    if unknown:
+        raise IssueHostError(
+            f"{FORGE_OVERRIDE_FILENAME} 'platforms' names unsupported "
+            f"{', '.join(repr(name) for name in unknown)}; supported platforms: "
+            f"{', '.join(SUPPORTED_PLATFORMS)}"
+        )
+    return platforms
 
 
 def declared_instance_for(

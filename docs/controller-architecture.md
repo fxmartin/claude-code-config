@@ -1979,7 +1979,7 @@ serving host while pinned jobs are queued; run it as a worker.
 
 `sdlc queue run --worker m3max --pool claude-m3 --pool codex-shared [--host
 NAME]` makes a drain a fleet worker. At start it registers
-`{worker, host, pools, harnesses, sandbox, repos, slots, slots_free}` and then
+`{worker, host, platform, pools, harnesses, sandbox, repos, slots, slots_free}` and then
 re-registers every 30 s (registration *is* the heartbeat), carrying the live
 free-slot count (`--slots` minus the slots running jobs hold):
 
@@ -1990,6 +1990,9 @@ free-slot count (`--slots` minus the slots running jobs hold):
 - `repos` — names of the git clones directly under `~/Work`;
 - `host` — the short hostname unless `--host` says otherwise; a job's `--host`
   pin matches it;
+- `platform` — `platform.system().lower()`, `darwin` or `linux` (Story
+  35.2-015, queue.db migration 19; `sdlc queue workers` shows it, `-` for a
+  worker that predates it);
 - `pools` — free-form and declared, never detected, because only the operator
   knows which subscription a machine is signed in to. The recommended names are
   `claude-m3`, `claude-shared` and `codex-shared`. A declared `codex-shared` is
@@ -2011,7 +2014,10 @@ every `requirements.harness` to be among its harnesses (`harness` may list
 several, `claude,codex`); and `requirements.sandbox` to be met (`true`/
 `container` = any runtime, `podman`/`docker` = that runtime, `false`/empty = not
 needed). A job with `codex` among its harnesses also needs the `codex-shared`
-pool. A worker with no free slot claims nothing.
+pool. A job whose `requirements.platform` lists platforms (Story 35.2-015) needs
+a worker on one of them — `platform linux` in `no eligible worker (needs …)`;
+a worker that never reported a platform may run it, and a job without one runs
+anywhere. A worker with no free slot claims nothing.
 
 **Ordering.** Eligible first, then *least loaded*: a worker defers a job when
 another online, eligible worker has strictly more free slots (a tie goes to
@@ -2708,7 +2714,19 @@ host, not its name): unknown → exit 2 listing the registered workers, and a
 service that cannot list them fails the enqueue rather than accept a pin no
 worker may ever claim. A `github`/`gitlab` value, in either form, keeps its
 older meaning — the forge override, handed to the run as `--host=<forge>` — so
-a machine named `github` or `gitlab` cannot be pinned. `sdlc queue list` gained
+a machine named `github` or `gitlab` cannot be pinned.
+
+**Platforms (Story 35.2-015).** A repo whose suite passes only on some OSes
+declares them beside `forge:` in its `.sdlc-forge.yaml` — `platforms: [linux]`
+(`darwin`/`linux`; a bare string works, anything else fails the enqueue, exit 2)
+— and its fleet jobs carry `requirements.platform` (comma-joined), which the
+claim matcher holds to a worker's advertised `platform`. A `--host` whose
+workers all report another platform is refused before anything is recorded,
+naming both platforms with the remedy: build locally (`sdlc build <scope>
+--auto`) or pick a matching host (listed when one is registered). Unpinned, the
+job is recorded even when no registered worker runs a declared platform, with a
+`warning:` saying so. The service must be upgraded before an enqueuer that sends
+the key: an older one refuses an unknown requirement with a 400. `sdlc queue list` gained
 `WORKER`, `HOST` and `POOL` columns, each as wide as its longest value.
 
 `sdlc queue run --worker` drains it (Story 35.2-005, next section) and a bare `queue run` refuses while a fleet queue is configured; `sdlc queue unpause --pool` works against it (Story 35.2-003); `sdlc queue serve` always serves the local store.

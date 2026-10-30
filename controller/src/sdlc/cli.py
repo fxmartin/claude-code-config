@@ -15,7 +15,7 @@ import typer
 from sdlc import __version__
 from sdlc.contracts import AGENT_SCHEMAS, ContractError, parse_and_validate
 from sdlc.eval_compare import DEFAULT_TOLERANCE
-from sdlc.queue import HEARTBEAT_SECONDS, QueueBackend, QueueError
+from sdlc.queue import HEARTBEAT_SECONDS, QueueBackend, QueueError, WorkerRecord
 # `sdlc queue run`'s defaults live with the scheduler, so `--help` prints the
 # real figures rather than a copy that can drift (Story 32.1-002).
 from sdlc.scheduler import (
@@ -217,10 +217,17 @@ def _job_requirements(cli_args: list[str], harness_map: dict[str, str]) -> dict[
     that does not have the clone fetch it (35.2-002); a repo with no ``origin``
     remote simply omits it. It is recorded with any URL credential stripped —
     the queue service never holds a token, and the worker clones with its own
-    forge login.
+    forge login. ``platform`` is the comma-joined ``platforms`` the repo's
+    ``.sdlc-forge.yaml`` declares (Story 35.2-015), omitted when it declares none;
+    a malformed declaration raises :class:`~sdlc.issue_host.IssueHostError`.
     """
     from sdlc.harness import DEFAULT_HARNESS
-    from sdlc.issue_host import _remote_url, strip_remote_credentials
+    from sdlc.issue_host import (
+        FORGE_OVERRIDE_FILENAME,
+        _remote_url,
+        load_repo_platforms,
+        strip_remote_credentials,
+    )
     from sdlc.role_routing import PIPELINE_ROLES
 
     routed = _effective_harness_map(harness_map)
@@ -234,6 +241,9 @@ def _job_requirements(cli_args: list[str], harness_map: dict[str, str]) -> dict[
         requirements["origin"] = strip_remote_credentials(origin)
     if "--sandbox" in cli_args:
         requirements["sandbox"] = "container"
+    platforms = load_repo_platforms(override_path=root / FORGE_OVERRIDE_FILENAME)
+    if platforms:
+        requirements["platform"] = ",".join(platforms)
     return requirements
 
 
@@ -303,7 +313,12 @@ def _enqueue_job(
     Story 35.3-002: a ``build`` job also carries the issue mapping of each story in
     its scope (:func:`_scope_issue_mappings`) — data, never a token — which the
     worker seeds into its clone's ledger before the first stage.
+
+    Story 35.2-015: a repo that declares ``platforms`` refuses a ``--host`` whose
+    workers all run another one, before anything is recorded; unpinned, the job is
+    recorded with a warning when no registered worker can run it yet.
     """
+    from sdlc.issue_host import IssueHostError
     from sdlc.queue_client import QueueClient, open_queue
     from sdlc.queue_worker import origin_requirements
 
@@ -318,17 +333,22 @@ def _enqueue_job(
                 "--host/--pool need a fleet queue: set SDLC_QUEUE_URL "
                 "(or queue_url in .sdlc-queue.yaml / ~/.sdlc-fleet.yaml)"
             )
+        requirements = _job_requirements(cli_args, harness_map or {}) if fleet else {}
+        platforms = _csv_values(requirements.get("platform"))
+        warning = None
         if host:
-            _require_known_host(store, host)
+            _require_platform_host(
+                _require_known_host(store, host), host, platforms, kind=kind, scope=scope
+            )
+        elif platforms:
+            warning = _no_platform_worker_warning(store, platforms, kind=kind, scope=scope)
         store.init()
         repo = str(Path.cwd().resolve())
         # One requirements value either way. A fleet job's already carries the
         # origin; a local job records just that (Story 35.2-002), so a worker can
         # clone the repo, or check its own clone against it, without a path.
         requirements_json = (
-            json.dumps(_job_requirements(cli_args, harness_map or {}))
-            if fleet
-            else origin_requirements(Path(repo))
+            json.dumps(requirements) if fleet else origin_requirements(Path(repo))
         )
         fleet_fields: dict[str, Any] = {"host": host, "pool": pool} if fleet else {}
         job_id = store.add_job(
@@ -337,24 +357,80 @@ def _enqueue_job(
             issues_json=_scope_issue_mappings(scope) if kind == "build" else None,
             **fleet_fields,
         )
-    except QueueError as exc:
+    except (QueueError, IssueHostError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     where = f" on {store.url}" if isinstance(store, QueueClient) else ""
     pinned = "".join(f", {label} {value}" for label, value in (("host", host), ("pool", pool)) if value)
     typer.echo(f"queued: job {job_id} ({kind} {scope}){where} in {repo}{pinned}")
+    if warning:
+        typer.echo(f"warning: {warning}", err=True)
 
 
-def _require_known_host(store: QueueBackend, host: str) -> None:
+def _csv_values(value: str | None) -> list[str]:
+    """``"darwin,linux"`` → ``["darwin", "linux"]``; nothing for ``None``/blank."""
+    return [part for part in (value or "").split(",") if part]
+
+
+def _platform_fix_hint(
+    platforms: list[str], workers: list[WorkerRecord], *, kind: str, scope: str
+) -> str:
+    """Build it locally, or name the hosts whose workers run one of ``platforms``."""
+    hosts = sorted({w.host for w in workers if w.platform in platforms})
+    where = f" ({', '.join(hosts)})" if hosts else ""
+    return f"build it locally (`sdlc {kind} {scope} --auto`) or pick a matching host{where}"
+
+
+def _require_platform_host(
+    workers: list[WorkerRecord], host: str, platforms: list[str], *, kind: str, scope: str
+) -> None:
+    """Refuse a ``--host`` whose workers all run a platform the repo does not (Story 35.2-015).
+
+    A worker that never reported its platform may run anything, so it keeps the
+    pin acceptable, exactly as it would satisfy the claim matcher's need.
+    """
+    pinned = [w for w in workers if w.host == host]
+    if not platforms or any(w.platform is None or w.platform in platforms for w in pinned):
+        return
+    theirs = ", ".join(sorted({w.platform for w in pinned if w.platform}))
+    raise QueueError(
+        f"host {host!r} runs {theirs}, but this repo builds only on "
+        f"{', '.join(platforms)} (platforms in .sdlc-forge.yaml): "
+        + _platform_fix_hint(platforms, workers, kind=kind, scope=scope)
+    )
+
+
+def _no_platform_worker_warning(
+    store: QueueBackend, platforms: list[str], *, kind: str, scope: str
+) -> str | None:
+    """Why an unpinned job no registered worker can run yet will wait, or None.
+
+    Best-effort: the job is recorded either way, so a service that cannot list its
+    workers just means no warning.
+    """
+    try:
+        workers = store.list_workers()
+    except QueueError:
+        return None
+    if any(w.platform is None or w.platform in platforms for w in workers):
+        return None
+    return (
+        f"no registered worker runs {' or '.join(platforms)} yet — the job waits "
+        f"until one does; " + _platform_fix_hint(platforms, workers, kind=kind, scope=scope)
+    )
+
+
+def _require_known_host(store: QueueBackend, host: str) -> list[WorkerRecord]:
     """Refuse a ``--host`` no registered worker runs on, naming the ones that do.
 
     A pin is matched on a worker's ``host`` (Story 35.2-001's claim matching), so
     that is what is checked — a worker's name is not a host. A service that
     cannot list its workers fails the enqueue: an unchecked pin may strand the job.
+    Returns the registered workers, for the platform check that follows.
     """
     workers = store.list_workers()
     if any(worker.host == host for worker in workers):
-        return
+        return workers
     known = ", ".join(f"{worker.name} (host {worker.host})" for worker in workers)
     raise QueueError(
         f"unknown host {host!r}: " + (f"known workers: {known}" if known else "no workers are registered")
@@ -392,7 +468,9 @@ Flags:
                              harness/sandbox it needs recorded (Story 35.3-001)
   --host=WORKER-HOST        --enqueue only: pin the fleet job to the machine
                              named (`--host home-lab` or `--host=home-lab`); an
-                             unknown host is refused, listing the known workers.
+                             unknown host is refused, listing the known workers,
+                             and so is a host whose workers run none of the
+                             repo's `platforms` (.sdlc-forge.yaml, Story 35.2-015).
                              `--host github|gitlab` (either form) is still the
                              forge override below
   --pool=POOL               --enqueue only: run the fleet job only on a worker
@@ -742,7 +820,9 @@ Flags:
                              harness/sandbox it needs recorded (Story 35.3-001)
   --host=WORKER-HOST        --enqueue only: pin the fleet job to the machine
                              named (`--host home-lab` or `--host=home-lab`); an
-                             unknown host is refused, listing the known workers.
+                             unknown host is refused, listing the known workers,
+                             and so is a host whose workers run none of the
+                             repo's `platforms` (.sdlc-forge.yaml, Story 35.2-015).
                              `--host github|gitlab` (either form) is still the
                              forge override (issue #606)
   --pool=POOL               --enqueue only: run the fleet job only on a worker
@@ -3807,7 +3887,8 @@ def queue_workers_cmd(
 
     One row per worker that `sdlc queue run --worker` has registered with this
     queue — the fleet's (``SDLC_QUEUE_URL``) when one is configured, else the
-    local one: its host, the subscription pools it serves, free/total agent
+    local one: its host, its platform (`darwin`/`linux`, `-` for a worker that
+    never reported one — Story 35.2-015), the subscription pools it serves, free/total agent
     slots as of its last heartbeat, how long ago that was, and whether it is
     `online`. A worker silent for three heartbeats (90 s) is `offline`, and the
     leases it held become reclaimable. A worker whose own agent probe failed
@@ -3826,11 +3907,11 @@ def queue_workers_cmd(
         typer.echo("no workers registered.")
         raise typer.Exit(code=0)
     typer.echo(
-        f"{'NAME':<16}{'HOST':<20}{'POOLS':<34}{'SLOTS':<8}{'HEARTBEAT':<12}STATUS"
+        f"{'NAME':<16}{'HOST':<20}{'PLATFORM':<10}{'POOLS':<34}{'SLOTS':<8}{'HEARTBEAT':<12}STATUS"
     )
     for w in workers:
         typer.echo(
-            f"{w.name:<16}{w.host:<20}{','.join(w.pools) or '-':<34}"
+            f"{w.name:<16}{w.host:<20}{w.platform or '-':<10}{','.join(w.pools) or '-':<34}"
             f"{f'{w.effective_slots_free}/{w.slots}':<8}{_format_since(now, w.last_heartbeat):<12}"
             f"{'online' if w.is_online(now) else 'offline'}"
             f"{'' if w.can_run_agents else ' — cannot run agents: ' + _self_check_reason(w)}"
@@ -4410,7 +4491,7 @@ def queue_serve_cmd(
                                      -> job, or 204 when nothing is claimable
       POST   /workers                register or heartbeat: worker, host, \\[pools,
                                      harnesses, sandbox, repos, slots, slots_free,
-                                     forges]
+                                     forges, platform]
                                      -> a claim by a registered worker is matched
                                      on these (see `queue run --worker`)
       GET    /workers                {workers} with an `online` flag each

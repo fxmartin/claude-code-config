@@ -155,7 +155,10 @@ gitlab_url: http://127.0.0.1:8080
 ```
 
 `forge:` is required and must be `github` or `gitlab`; `<forge>_url:` (e.g.
-`gitlab_url:`, `github_url:`) is optional and names the instance's base URL. No
+`gitlab_url:`, `github_url:`) is optional and names the instance's base URL.
+An optional `platforms:` list (`[linux]`, `[darwin, linux]`) names the OSes the
+repo's suite passes on, so fleet jobs only land on a worker running one of them
+(Story 35.2-015 — see *Platforms* in `controller-architecture.md`). No
 file present is byte-identical to today — the declaration is purely additive,
 same as `.sdlc-harness.yaml`. When an instance is declared, every CLI call the
 resolved adapter makes targets it via a **per-invocation** env override —

@@ -65,7 +65,7 @@ _REQUEST_TIMEOUT_SECONDS = 30
 WHOIS_CACHE_SECONDS = 60
 _WHOIS_TIMEOUT_SECONDS = 5
 _MAX_LEASE_SECONDS = 24 * 3600
-_REQUIREMENT_KEYS = frozenset({"repo", "origin", "harness", "sandbox"})
+_REQUIREMENT_KEYS = frozenset({"repo", "origin", "harness", "sandbox", "platform"})
 
 
 class BindError(ValueError):
@@ -483,6 +483,7 @@ class _Routes:
                 forges=_bool_map(body, "forges"),
                 now=self._now(),
                 self_check=_self_check(body),
+                platform=_text(body, "platform"),
             )
         except QueueError as exc:
             raise _ApiError(400, str(exc)) from exc

@@ -65,7 +65,7 @@ def test_workers_lists_pools_slots_heartbeat_and_status(store) -> None:
     assert "claude-shared" in lines["xps"] and "1/1" in lines["xps"]
     assert "offline" in lines["xps"] and "10m ago" in lines["xps"]
     header = result.output.splitlines()[0].split()
-    assert header == ["NAME", "HOST", "POOLS", "SLOTS", "HEARTBEAT", "STATUS"]
+    assert header == ["NAME", "HOST", "PLATFORM", "POOLS", "SLOTS", "HEARTBEAT", "STATUS"]
 
 
 def test_workers_json_carries_every_capability_and_online(store) -> None:

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform as _platform
 import re
 import shlex
 import shutil
@@ -81,6 +82,9 @@ class WorkerProfile:
     # ``{forge host: the scheme its clones reach it over}`` — never sent, but the scheduler's
     # later look for a login must ask over it: a plaintext GitLab's lives in another config.
     forge_schemes: dict[str, str] = field(default_factory=dict)
+    # ``platform.system().lower()`` — `darwin`, `linux` — matched against a repo's
+    # declared `platforms` (Story 35.2-015).
+    platform: str | None = None
 
     def register_with(
         self, queue: "QueueBackend", *, slots: int, slots_free: int, **extra: Any
@@ -93,6 +97,8 @@ class WorkerProfile:
         # Only when there is something to say: a backend that predates the flag keeps working.
         if self.forges:
             extra.setdefault("forges", self.forges)
+        if self.platform:
+            extra.setdefault("platform", self.platform)
         return queue.register_worker(
             self.name,
             host=self.host,
@@ -156,6 +162,7 @@ def detect_worker_profile(
     runtime: Callable[[], str] | None = None,
     dashboard_url: str | None = None,
     forge_probe: Callable[[str, str], bool] | None = None,
+    system: Callable[[], str] | None = None,
 ) -> WorkerProfile:
     """Probe this machine for what it can run.
 
@@ -168,7 +175,8 @@ def detect_worker_profile(
     codex stage needs both, so a unit may declare the pool before Codex is
     installed and the box joins it by installing Codex, not by editing the unit.
     ``forge_probe`` answers, per forge host its clones sit on, whether the forge
-    CLI is logged in there.
+    CLI is logged in there. ``system`` is :func:`platform.system`, injectable like the
+    rest; its lower-cased answer is the platform the worker advertises.
     """
     from sdlc.dispatch import SandboxUnavailableError, detect_container_runtime
     from sdlc.doctor import _default_dep_probe
@@ -204,6 +212,7 @@ def detect_worker_profile(
         dashboard_url=origin,
         forges={forge: can_authenticate(forge, scheme) for forge, scheme in forge_schemes.items()},
         forge_schemes=forge_schemes,
+        platform=(system or _platform.system)().strip().lower() or None,
     )
 
 
