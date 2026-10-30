@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.127.1] - 2026-10-30
+
+### Fixed
+
+- fix(controller): install a dropped self-update from main (#944)
+- fix(controller): point a dropped self-update at deploy.sh (#944)
+- fix(controller): address #944 review findings
+- fix(controller): name the run in the reinstall park hint (#944)
+- fix(controller): park runs when the install is swapped (#944)
+
+
 ## [v2.127.0] - 2026-10-30
 
 ### Added
