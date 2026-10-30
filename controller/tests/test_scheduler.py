@@ -2816,7 +2816,10 @@ def test_self_update_defers_while_another_host_run_is_active(tmp_path) -> None:
     # Re-running the drain would not help: a self-update fires only when a job
     # is admitted or finishes, and an empty queue admits none.
     assert "sdlc queue run" not in dropped[0]
-    assert f"{repo}/scripts/deploy.sh" in dropped[0]
+    # deploy.sh installs the working tree, which may sit on an old feature
+    # branch: the checkout is brought to the base ref first, as the updater does.
+    assert f"git -C {repo} switch main && git -C {repo} pull --ff-only" in dropped[0]
+    assert dropped[0].index("pull --ff-only") < dropped[0].index(f"{repo}/scripts/deploy.sh")
     assert "sdlc queue requeue" in dropped[0]
 
 

@@ -1100,12 +1100,16 @@ class _Scheduler:
         Issue #944: another run on the host can outlast a one-shot drain. The
         drain does not wait for it (that run could hold it open indefinitely),
         and re-running the drain would not retry it either: a self-update fires
-        only when a job is admitted or finishes. So name the manual install.
+        only when a job is admitted or finishes. So name the manual install —
+        from the base ref, as the updater would: deploy.sh installs the working
+        tree, which may be parked on an older feature branch.
         """
         if not self._pending_self_update:
             return
         deploys = " / ".join(
-            f"`{repo}/scripts/deploy.sh`" for repo in sorted(self._pending_self_update)
+            f"`git -C {repo} switch main && git -C {repo} pull --ff-only && "
+            f"{repo}/scripts/deploy.sh`"
+            for repo in sorted(self._pending_self_update)
         )
         self._echo(
             f"self-update not applied: sdlc runs still active on this host "
