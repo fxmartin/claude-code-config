@@ -1098,14 +1098,20 @@ class _Scheduler:
         """Say so when the drain ends with a deferred self-update never applied.
 
         Issue #944: another run on the host can outlast a one-shot drain. The
-        drain does not wait for it (that run could hold it open indefinitely).
+        drain does not wait for it (that run could hold it open indefinitely),
+        and re-running the drain would not retry it either: a self-update fires
+        only when a job is admitted or finishes. So name the manual install.
         """
         if not self._pending_self_update:
             return
+        deploys = " / ".join(
+            f"`{repo}/scripts/deploy.sh`" for repo in sorted(self._pending_self_update)
+        )
         self._echo(
             f"self-update not applied: sdlc runs still active on this host "
-            f"({', '.join(self._self_update_blockers) or 'unknown'}); re-run "
-            f"`sdlc queue run --self-update` once they finish"
+            f"({', '.join(self._self_update_blockers) or 'unknown'}); once they "
+            f"finish, run {deploys}, then `sdlc queue requeue` any job blocked "
+            f"on the controller version"
         )
 
     def _pass(self) -> bool:

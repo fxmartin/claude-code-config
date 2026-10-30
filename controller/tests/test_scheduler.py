@@ -2813,7 +2813,11 @@ def test_self_update_defers_while_another_host_run_is_active(tmp_path) -> None:
     assert "other-run" in deferred[0]
     dropped = [line for line in lines if "self-update not applied" in line]
     assert len(dropped) == 1, "a one-shot drain says at exit that the update was dropped"
-    assert "sdlc queue run --self-update" in dropped[0]
+    # Re-running the drain would not help: a self-update fires only when a job
+    # is admitted or finishes, and an empty queue admits none.
+    assert "sdlc queue run" not in dropped[0]
+    assert f"{repo}/scripts/deploy.sh" in dropped[0]
+    assert "sdlc queue requeue" in dropped[0]
 
 
 def test_self_update_applies_at_the_boundary_after_the_other_run_ends(tmp_path) -> None:
