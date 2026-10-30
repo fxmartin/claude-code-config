@@ -15,7 +15,7 @@ from typer.testing import CliRunner
 
 from sdlc.cli import app
 from sdlc.issue_host import IssueHostError, load_repo_platforms
-from sdlc.queue import QueueStore
+from sdlc.queue import QueueError, QueueStore
 from sdlc.queue_client import QueueClient
 from sdlc.queue_server import AccessPolicy, make_server
 from sdlc.queue_worker import WorkerProfile, detect_worker_profile
@@ -356,3 +356,16 @@ def test_a_malformed_platforms_key_refuses_the_enqueue(fleet, repo) -> None:
     assert result.exit_code == 2
     assert "platforms" in result.output
     assert fleet.list_jobs() == []
+
+
+def test_an_unlistable_worker_roster_means_no_warning_but_still_records(fleet, repo) -> None:
+    _linux_only(repo)
+
+    def _down() -> list:
+        raise QueueError("service unreachable")
+
+    fleet.list_workers = _down  # type: ignore[method-assign]
+
+    from sdlc.cli import _no_platform_worker_warning
+
+    assert _no_platform_worker_warning(fleet, ["linux"], kind="build", scope="15.1-004") is None
