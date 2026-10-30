@@ -1,6 +1,6 @@
 # Epic 12: Controller Robustness & Failure Recovery
 
-> **Status: IN PROGRESS (12/13)** — 12.2-005 (the ledger exclude is written only inside a real git repository) added 2026-10-29 from issue #835. all 12 stories merged on `main` (PRs through #98). Created 2026-06-20 from [issue #72](https://github.com/fxmartin/claude-code-config/issues/72),
+> **Status: COMPLETE (13/13)** — 12.2-005 (the ledger exclude is written only inside a real git repository) added 2026-10-29 from issue #835, merged the same day (job 48, #936). all 12 stories merged on `main` (PRs through #98). Created 2026-06-20 from [issue #72](https://github.com/fxmartin/claude-code-config/issues/72),
 > a post-mortem of the `sdlc build epic-10` run (ledger run `a07a1855`). Distinct from
 > Epic-10 (which *completed the stub CLI verbs*) and Epic-11 (realtime/multi-run
 > *observability*): this epic makes the controller **resilient** — it should not strand
@@ -311,6 +311,7 @@ recovered. References 12.2-002 (extends it) and 12.1-001 (envelope recovery).
 **Risk Level**: Medium
 
 ##### Story 12.2-005: The ledger exclude is written only inside a real git repository
+**Status**: Done
 **User Story**: As FX, I want the controller to add its ledger exclude only
 to a real repository's git dir, so that running `sdlc` in a directory that
 isn't a repo can never leave a `.git/info/exclude` behind that makes
