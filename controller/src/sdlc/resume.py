@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from sdlc import teardown
+from sdlc import install_guard, teardown
 from sdlc.build import (
     _STAGES,
     BuildOptions,
@@ -22,6 +22,7 @@ from sdlc.build import (
     _log_predictor_posture,
     _log_routing_banner,
     _make_rate_limit_context,
+    _park_on_reinstall,
     _prepare_story_workdir,
     _registry_finish,
     _registry_register,
@@ -523,6 +524,7 @@ def run_resume(
     untouched (:func:`unstarted_fix_batch`); one left ``IN_PROGRESS`` is closed
     ``ABORTED`` (:func:`close_unstarted_fix_batch`), a red one stays ``FAILED``.
     """
+    install_guard.arm()
     scope = canonical_scope(scope)
     rid = run_id or ledger.latest_resumable_run(scope)
     if rid is None:
@@ -800,10 +802,13 @@ def run_resume(
     def _run_one_parallel(story: Story) -> _StoryRunOutcome:
         # Parallel resume isolates each re-entered story in its own worktree so
         # concurrent agents never collide in the shared checkout (Story 17.2-001).
-        workdir = _prepare_story_workdir(
-            opts, story, ledger, rid, real_run=dispatcher is None
-        )
-        return _run_one(story, workdir=workdir)
+        def _drive() -> _StoryRunOutcome:
+            workdir = _prepare_story_workdir(
+                opts, story, ledger, rid, real_run=dispatcher is None
+            )
+            return _run_one(story, workdir=workdir)
+
+        return _park_on_reinstall(ledger, rid, story.id, _drive)
 
     # Story 19.2-002: credit each re-entered story's terminal status the instant
     # its worker finishes — before the scheduler applies the outcome — so the
@@ -875,7 +880,9 @@ def run_resume(
                 f"(attempt {st.start_attempt})",
             )
             try:
-                sr = _run_one(story, workdir=None)
+                sr = _park_on_reinstall(
+                    ledger, rid, story.id, lambda: _run_one(story, workdir=None)
+                )
             except _CostGatePause as gate:
                 # Story 14.1-002: the cost gate re-halted this stage on resume.
                 status[story.id] = "NEEDS_ATTENTION"

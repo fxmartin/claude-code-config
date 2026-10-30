@@ -2780,6 +2780,99 @@ def test_self_update_waits_until_no_sibling_job_is_in_flight(tmp_path) -> None:
     assert [store.get_job(j).state for j in (first, sibling, later)] == ["done"] * 3
 
 
+# --- Issue #944: a self-update never swaps the env under another run on the host ---
+
+
+def _other_run(run_id: str = "other-run") -> RunRecord:
+    return RunRecord(
+        run_id=run_id, repo="/elsewhere", db="/elsewhere/l.db", scope="1.1-001",
+        pid=os.getppid(), status="IN_PROGRESS", started_at="2026-10-30T15:00:00+00:00",
+    )
+
+
+def test_self_update_defers_while_another_host_run_is_active(tmp_path) -> None:
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "controller")
+    job = store.add_job(repo=repo, kind="fix", scope="1")
+    release = _Release()
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(_other_run())
+    lines: list[str] = []
+
+    _run(store, tmp_path=tmp_path, launcher=_ReleasingLauncher(release),
+         config=SchedulerConfig(slots=1, poll_seconds=1.0, self_update=True),
+         version_check=release.check, self_updater=release.updater,
+         installed_version=release.installed, registry=registry, echo=lines.append)
+
+    assert release.updates == []
+    assert store.get_job(job).state == "done"
+    deferred = [line for line in lines if "self-update deferred" in line]
+    assert len(deferred) == 1, "announced once, not on every poll"
+    assert "other-run" in deferred[0]
+    dropped = [line for line in lines if "self-update not applied" in line]
+    assert len(dropped) == 1, "a one-shot drain says at exit that the update was dropped"
+    # Re-running the drain would not help: a self-update fires only when a job
+    # is admitted or finishes, and an empty queue admits none.
+    assert "sdlc queue run" not in dropped[0]
+    # deploy.sh installs the working tree, which may sit on an old feature
+    # branch: the checkout is brought to the base ref first, as the updater does.
+    assert f"git -C {repo} switch main && git -C {repo} pull --ff-only" in dropped[0]
+    assert dropped[0].index("pull --ff-only") < dropped[0].index(f"{repo}/scripts/deploy.sh")
+    assert "sdlc queue requeue" in dropped[0]
+
+
+def test_self_update_applies_at_the_boundary_after_the_other_run_ends(tmp_path) -> None:
+    from sdlc.scheduler import SchedulerConfig
+
+    class _OneBoundary(Registry):
+        """Another run is live for the first boundary only."""
+
+        checks = 0
+
+        def active_sdlc_runs(self, *, exclude_pid=None):
+            self.checks += 1
+            return [_other_run()] if self.checks == 1 else []
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "controller")
+    first = store.add_job(repo=repo, kind="fix", scope="1")
+    later = store.add_job(repo=repo, kind="fix", scope="2")
+    release = _Release()
+
+    _run(store, tmp_path=tmp_path, launcher=_ReleasingLauncher(release),
+         config=SchedulerConfig(slots=1, poll_seconds=1.0, self_update=True),
+         version_check=release.check, self_updater=release.updater,
+         installed_version=release.installed,
+         registry=_OneBoundary(tmp_path / "registry.json"))
+
+    assert release.updates, "the deferred reinstall was never retried"
+    assert [store.get_job(j).state for j in (first, later)] == ["done", "done"]
+
+
+def test_self_update_ignores_finished_and_dead_runs(tmp_path) -> None:
+    from sdlc.scheduler import SchedulerConfig
+
+    store = _store(tmp_path)
+    repo = _repo(tmp_path, "controller")
+    store.add_job(repo=repo, kind="fix", scope="1")
+    release = _Release()
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(_other_run("finished"))
+    registry.mark_finished("finished", "DONE")
+    dead = _other_run("dead")
+    dead.pid = _dead_pid()
+    registry.register(dead)
+
+    _run(store, tmp_path=tmp_path, launcher=_ReleasingLauncher(release),
+         config=SchedulerConfig(slots=1, poll_seconds=1.0, self_update=True),
+         version_check=release.check, self_updater=release.updater,
+         installed_version=release.installed, registry=registry)
+
+    assert release.updates, "a run that is not live must not hold the reinstall"
+
+
 # --- #716: a requeued job whose run is terminal starts fresh --------------
 
 

@@ -1050,6 +1050,9 @@ class _Scheduler:
         # Repos whose self-update was deferred because a sibling job was still
         # in flight; retried once the last one is reaped.
         self._pending_self_update: set[str] = set()
+        # The other host runs last named as holding a self-update, so a deferral
+        # retried on every poll is announced once.
+        self._self_update_blockers: list[str] = []
         self._in_flight: dict[int, _InFlight] = {}
         self._result = SchedulerResult()
         self._poll_interval = approval_poll_interval(config.approval_poll_seconds)
@@ -1083,12 +1086,37 @@ class _Scheduler:
                         outage = False
                         self._echo("fleet queue reachable again")
                     if stop:
+                        self._report_dropped_self_update()
                         break
                 self._sleep(self._config.poll_seconds)
         except KeyboardInterrupt:
             self._result.interrupted = True
             self._shutdown()
         return self._result
+
+    def _report_dropped_self_update(self) -> None:
+        """Say so when the drain ends with a deferred self-update never applied.
+
+        Issue #944: another run on the host can outlast a one-shot drain. The
+        drain does not wait for it (that run could hold it open indefinitely),
+        and re-running the drain would not retry it either: a self-update fires
+        only when a job is admitted or finishes. So name the manual install —
+        from the base ref, as the updater would: deploy.sh installs the working
+        tree, which may be parked on an older feature branch.
+        """
+        if not self._pending_self_update:
+            return
+        deploys = " / ".join(
+            f"`git -C {repo} switch main && git -C {repo} pull --ff-only && "
+            f"{repo}/scripts/deploy.sh`"
+            for repo in sorted(self._pending_self_update)
+        )
+        self._echo(
+            f"self-update not applied: sdlc runs still active on this host "
+            f"({', '.join(self._self_update_blockers) or 'unknown'}); once they "
+            f"finish, run {deploys}, then `sdlc queue requeue` any job blocked "
+            f"on the controller version"
+        )
 
     def _pass(self) -> bool:
         """One turn of the loop; True when the drain is done."""
@@ -1781,6 +1809,17 @@ class _Scheduler:
             # meets the guard meanwhile parks with the marker and is requeued.
             self._pending_self_update.add(repo)
             return False
+        # Issue #944: so would a direct `sdlc build`/`fix`/`resume`, or another
+        # worker's job, anywhere on this host. Same deferral: `_reap` retries.
+        others = sorted(run.run_id for run in self._registry.active_sdlc_runs())
+        if others:
+            self._pending_self_update.add(repo)
+            if others != self._self_update_blockers:
+                self._echo(f"self-update deferred: sdlc runs active on this host: "
+                           f"{', '.join(others)}")
+            self._self_update_blockers = others
+            return False
+        self._self_update_blockers = []
         self._pending_self_update.discard(repo)
         installed = self._self_updater(Path(repo), self._installed_version)
         if installed is None:

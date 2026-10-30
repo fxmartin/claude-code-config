@@ -1536,6 +1536,10 @@ def runs(
     prune: bool = typer.Option(
         False, "--prune", help="Remove crashed (dead-pid) entries before listing."
     ),
+    active: bool = typer.Option(
+        False, "--active",
+        help="List only live, unfinished runs, one per line; nothing when none is.",
+    ),
 ) -> None:
     """List every known run across repos from the host-level registry.
 
@@ -1552,6 +1556,11 @@ def runs(
         removed = registry.prune()
         if not as_json:
             typer.echo(f"pruned {removed} dead run(s).")
+
+    if active:
+        for run in registry.active_sdlc_runs():
+            typer.echo(f"{run.run_id} {run.scope} pid {run.pid} {run.repo}")
+        raise typer.Exit(code=0)
 
     rows = registry.view()
     if as_json:

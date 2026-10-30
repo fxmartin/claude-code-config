@@ -48,6 +48,15 @@ echo plugin >>"${ORDER_LOG}"
 EOF
     chmod +x "${STUB_BIN}/claude"
 
+    # Stub `sdlc` for the live-run check (issue #944): prints ACTIVE_RUNS and
+    # exits ACTIVE_RUNS_EXIT, so a real run on this host cannot refuse the suite.
+    cat >"${STUB_BIN}/sdlc" <<'EOF'
+#!/usr/bin/env bash
+[[ -n "${ACTIVE_RUNS:-}" ]] && printf '%s\n' "${ACTIVE_RUNS}"
+exit "${ACTIVE_RUNS_EXIT:-0}"
+EOF
+    chmod +x "${STUB_BIN}/sdlc"
+
     # Stub container runtime for the sandbox-image step (issue #614), injected
     # via the SANDBOX_RUNTIME seam so no suite run ever builds a real image.
     # `build` records its argv; `image inspect` prints a podman-style bare id.
@@ -402,4 +411,56 @@ EOF
     [[ "$output" == *"sandbox image not built"* ]]
     [ -e "${CONTROLLER_MARKER}" ]
     [ -e "${PLUGIN_MARKER}" ]
+}
+
+# --- Issue #944: never reinstall the controller under a live run ---------------
+
+ACTIVE="48c748ba 01.1-002 pid 4242 /work/bootstrap-dev-server"
+
+@test "an active run refuses the deploy, names the run and changes nothing" {
+    ACTIVE_RUNS="${ACTIVE}" _run_deploy
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"48c748ba"* ]]
+    [[ "$output" == *"--force"* ]]
+    # A bare `sdlc resume` skips a parked run: the advice has to name it.
+    [[ "$output" == *"sdlc resume --run"* ]]
+    [ ! -e "${CONTROLLER_MARKER}" ]
+    [ ! -e "${PLUGIN_MARKER}" ]
+    [ ! -e "${SANDBOX_MARKER}" ]
+}
+
+@test "--force deploys over an active run and says so" {
+    ACTIVE_RUNS="${ACTIVE}" _run_deploy --force
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"48c748ba"* ]]
+    [ -e "${CONTROLLER_MARKER}" ]
+    [ -e "${PLUGIN_MARKER}" ]
+}
+
+@test "--dry-run reports the active run, exits 0 and changes nothing" {
+    ACTIVE_RUNS="${ACTIVE}" _run_deploy --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"48c748ba"* ]]
+    [[ "$output" == *"would refuse"* ]]
+    [ ! -e "${CONTROLLER_MARKER}" ]
+}
+
+@test "--plugin-only does not touch the controller, so a run never refuses it" {
+    ACTIVE_RUNS="${ACTIVE}" _run_deploy --plugin-only
+    [ "$status" -eq 0 ]
+    [ -e "${PLUGIN_MARKER}" ]
+    [ ! -e "${CONTROLLER_MARKER}" ]
+}
+
+@test "no active run deploys normally" {
+    _run_deploy
+    [ "$status" -eq 0 ]
+    [ -e "${CONTROLLER_MARKER}" ]
+}
+
+@test "an sdlc too old to list active runs warns and deploys" {
+    ACTIVE_RUNS_EXIT=2 _run_deploy
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"could not list active sdlc runs"* ]]
+    [ -e "${CONTROLLER_MARKER}" ]
 }

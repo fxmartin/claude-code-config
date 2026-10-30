@@ -61,6 +61,7 @@ __all__ = [
     "check_queue_service",
     "check_queue_whois",
     "check_registry_path",
+    "check_run_versions",
     "check_stashes",
     "check_usage_agreement",
     "check_worker_dashboard",
@@ -1762,6 +1763,29 @@ def check_queue_whois(
     return None
 
 
+def check_run_versions(registry: Registry, *, installed_version: str | None = None) -> Finding:
+    """Warn when a live run started on a controller older than the install (issue #944).
+
+    A reinstall swaps the tool's environment under every run on the host. Such a
+    run parks its stories at the next stage boundary; this says why before it does.
+    """
+    name = "Live runs vs installed controller"
+    installed = installed_version if installed_version is not None else INSTALLED_VERSION
+    behind = [
+        f"{run.run_id} ({run.controller_version})"
+        for run in registry.active_sdlc_runs()
+        if run.controller_version and _compare_versions(installed, run.controller_version) > 0
+    ]
+    if not behind:
+        return Finding("runs", name, "CLEAN", f"no live run is behind the install ({installed})")
+    return Finding(
+        "runs", name, "WARN",
+        f"installed {installed} is newer than live run(s): {', '.join(behind)}",
+        "expect their stories to park needs_attention, then, in each run's repo, "
+        "run: sdlc resume --run <id>",
+    )
+
+
 def check_runs(
     ledger: Ledger,
     registry: Registry,
@@ -2635,6 +2659,7 @@ def run_doctor(
         check_queue(queue_path),
         check_queue_service(queue_service_plist, queue_path=queue_path),
         check_runs(Ledger(db_path), registry, now=now, stale_after_s=stale_after_s),
+        check_run_versions(registry),
         check_config(repo_root),
         check_harness_pin(repo_root),
         check_deny_baseline(repo_root),

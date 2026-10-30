@@ -418,3 +418,33 @@ def test_view_keeps_cached_counts_when_ledger_corrupt(tmp_path):
     reg.register(_record("r1", pid=os.getpid(), db=str(bad), completed=1, total=4))
     [row] = reg.view()
     assert (row["completed"], row["total"]) == (1, 4)
+
+
+# --- Issue #944: which runs a controller reinstall would crash -----------------
+
+
+def _run_record(run_id: str, pid: int) -> RunRecord:
+    return RunRecord(run_id=run_id, repo="/r", db="/r/l.db", scope="s", pid=pid,
+                     status="IN_PROGRESS", started_at="t")
+
+
+def test_active_sdlc_runs_is_unfinished_with_a_live_pid(tmp_path) -> None:
+    reg = Registry(tmp_path / "registry.json")
+    reg.register(_run_record("live", os.getppid()))
+    reg.register(_run_record("finished", os.getppid()))
+    reg.mark_finished("finished", "DONE")
+    reg.register(_run_record("dead", 2**22 + 1))
+
+    assert [r.run_id for r in reg.active_sdlc_runs()] == ["live"]
+
+
+def test_active_sdlc_runs_excludes_this_process_by_default(tmp_path) -> None:
+    reg = Registry(tmp_path / "registry.json")
+    reg.register(_run_record("mine", os.getpid()))
+
+    assert reg.active_sdlc_runs() == []
+    assert [r.run_id for r in reg.active_sdlc_runs(exclude_pid=-1)] == ["mine"]
+
+
+def test_active_sdlc_runs_with_no_registry_is_empty(tmp_path) -> None:
+    assert Registry(tmp_path / "absent.json").active_sdlc_runs() == []

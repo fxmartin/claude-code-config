@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import socket
 import sqlite3
@@ -18,6 +19,7 @@ from typer.testing import CliRunner
 from sdlc.build import Ledger
 from sdlc.cli import app
 from sdlc.doctor import (
+    check_run_versions,
     MANAGED_PATHS,
     DoctorReport,
     Finding,
@@ -2412,3 +2414,39 @@ def test_installed_worker_agent_yields_nothing_when_neither_agent_exists(tmp_pat
     from sdlc.doctor import _installed_worker_agent
 
     assert _installed_worker_agent(tmp_path / "a.plist", tmp_path / "b.service") == ({}, None)
+
+
+# --- Issue #944: an install newer than a live run ------------------------------
+
+
+def _live_run(tmp_path, *, version: str | None) -> Registry:
+    registry = Registry(tmp_path / "registry.json")
+    registry.register(RunRecord(
+        run_id="48c748ba", repo="/r", db="/r/l.db", scope="01.1-002", pid=os.getppid(),
+        status="IN_PROGRESS", started_at="t", controller_version=version,
+    ))
+    return registry
+
+
+def test_doctor_warns_when_the_install_is_newer_than_a_live_run(tmp_path) -> None:
+    finding = check_run_versions(_live_run(tmp_path, version="2.126.0"),
+                                 installed_version="2.126.1")
+
+    assert finding.status == "WARN"
+    assert "48c748ba" in finding.detail and "2.126.0" in finding.detail
+    assert "sdlc resume --run" in finding.remedy
+
+
+@pytest.mark.parametrize("version", ["2.126.1", "2.127.0", None])
+def test_doctor_is_clean_when_no_live_run_is_behind_the_install(tmp_path, version) -> None:
+    finding = check_run_versions(_live_run(tmp_path, version=version),
+                                 installed_version="2.126.1")
+
+    assert finding.status == "CLEAN"
+
+
+def test_doctor_ignores_a_finished_run_on_an_older_controller(tmp_path) -> None:
+    registry = _live_run(tmp_path, version="2.126.0")
+    registry.mark_finished("48c748ba", "DONE")
+
+    assert check_run_versions(registry, installed_version="2.126.1").status == "CLEAN"

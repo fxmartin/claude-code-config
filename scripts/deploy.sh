@@ -32,8 +32,14 @@
 #   ./scripts/deploy.sh --controller-only  # no Claude Code on this box
 #   ./scripts/deploy.sh --plugin-only
 #   ./scripts/deploy.sh --skip-sandbox-image  # do not (re)build the sandbox image
+#   ./scripts/deploy.sh --force          # install over live sdlc runs (see below)
 #   ./scripts/deploy.sh --dry-run        # print what would run, change nothing
 #   ./scripts/deploy.sh --help
+#
+# Installing the controller swaps the tool's environment under every sdlc run on
+# this host (issue #944), so a deploy that would install it refuses while `sdlc
+# runs --active` lists any, naming them, with the machine untouched. Wait for them
+# or pass --force; a forced run parks needs_attention for `sdlc resume --run <id>`.
 #
 # A default run REQUIRES `claude` on PATH. It is checked in preflight, before
 # anything is installed, so a box without Claude Code aborts with the machine
@@ -72,9 +78,10 @@ DO_CONTROLLER=true
 DO_PLUGIN=true
 DO_SANDBOX=true
 DRY_RUN=false
+FORCE=false
 
 usage() {
-  sed -n '6,48p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '6,54p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 log() { printf '==> %s\n' "$*"; }
@@ -84,6 +91,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h)         usage; exit 0 ;;
     --dry-run)         DRY_RUN=true ;;
+    --force)           FORCE=true ;;
     --controller-only) DO_PLUGIN=false ;;
     --plugin-only)     DO_CONTROLLER=false ;;
     --skip-sandbox-image) DO_SANDBOX=false ;;
@@ -133,6 +141,15 @@ write_sandbox_pin() {
   mv "${tmp}" "${SANDBOX_PIN_FILE}"
 }
 
+# The live sdlc runs on this host, one per line. No `sdlc` means no installed
+# controller to replace; one that cannot answer (too old for --active, or itself
+# mid-swap) is reported, and the deploy goes on — it is what would fix that.
+active_sdlc_runs() {
+  command -v sdlc >/dev/null 2>&1 || return 0
+  sdlc runs --active 2>/dev/null \
+    || printf '==> warning: could not list active sdlc runs; deploying without that check\n' >&2
+}
+
 # Preflight — validate every precondition BEFORE mutating anything.
 #
 # The two steps move independent pointers, and step 1 cannot be rolled back once
@@ -142,7 +159,25 @@ write_sandbox_pin() {
 # Both preconditions are knowable up front, so we check them up front and abort
 # with the machine untouched.
 #
-# Skipped under --dry-run, which mutates nothing and so cannot drift.
+# Live runs (issue #944) are read first and also under --dry-run: a rehearsal
+# should say a real deploy would stop here. The rest is skipped under --dry-run,
+# which mutates nothing and so cannot drift.
+if [[ "${DO_CONTROLLER}" == true ]]; then
+  ACTIVE_RUNS="$(active_sdlc_runs)"
+  if [[ -n "${ACTIVE_RUNS}" ]]; then
+    if [[ "${FORCE}" == true ]]; then
+      log "--force: installing the controller under active sdlc runs: ${ACTIVE_RUNS}"
+    elif [[ "${DRY_RUN}" == true ]]; then
+      log "[dry-run] would refuse: active sdlc runs: ${ACTIVE_RUNS}"
+    else
+      die "active sdlc runs on this host; installing the controller would crash them:
+${ACTIVE_RUNS}
+       Nothing was changed. Wait for them to finish, or pass --force and
+       \`sdlc resume --run <id>\` each one from its repo once it parks."
+    fi
+  fi
+fi
+
 if [[ "${DRY_RUN}" == false ]]; then
   if [[ "${DO_CONTROLLER}" == true && ! -x "${INSTALL_CONTROLLER}" ]]; then
     die "controller installer not found or not executable: ${INSTALL_CONTROLLER}"
