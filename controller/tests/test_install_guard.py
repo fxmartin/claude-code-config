@@ -202,6 +202,21 @@ def test_a_missing_third_party_module_mid_swap_is_a_reinstall_crash(install) -> 
     assert install_guard.is_reinstall_crash(exc) is True
 
 
+def test_a_bad_name_in_a_controller_module_is_a_bug_on_a_stable_install(install) -> None:
+    # `from sdlc.doctor import nope`: the module exists, the symbol does not —
+    # a real bug, which must fail the story rather than park it as a swap.
+    install_guard.arm()
+    exc = ImportError("cannot import name 'nope' from 'sdlc.doctor'", name="sdlc.doctor")
+    assert install_guard.is_reinstall_crash(exc) is False
+
+
+def test_a_bad_name_in_a_controller_module_mid_swap_is_a_reinstall_crash(install) -> None:
+    install_guard.arm()
+    install.marker = None
+    exc = ImportError("cannot import name 'nope' from 'sdlc.doctor'", name="sdlc.doctor")
+    assert install_guard.is_reinstall_crash(exc) is True
+
+
 def test_an_unrelated_error_is_not_a_reinstall_crash(install) -> None:
     install_guard.arm()
     assert install_guard.is_reinstall_crash(ValueError("sdlc.parsers")) is False

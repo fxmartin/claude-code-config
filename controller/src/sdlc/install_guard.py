@@ -88,6 +88,8 @@ def is_reinstall_crash(exc: BaseException) -> bool:
     """
     if not isinstance(exc, ImportError):
         return False
-    if (exc.name or "").split(".", 1)[0] == "sdlc":
+    # Only a *missing* module: "cannot import name" from a present `sdlc.*`
+    # module is a code bug unless the marker below shows the install moved.
+    if isinstance(exc, ModuleNotFoundError) and (exc.name or "").split(".", 1)[0] == "sdlc":
         return True
     return install_marker() != _armed

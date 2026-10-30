@@ -1086,12 +1086,27 @@ class _Scheduler:
                         outage = False
                         self._echo("fleet queue reachable again")
                     if stop:
+                        self._report_dropped_self_update()
                         break
                 self._sleep(self._config.poll_seconds)
         except KeyboardInterrupt:
             self._result.interrupted = True
             self._shutdown()
         return self._result
+
+    def _report_dropped_self_update(self) -> None:
+        """Say so when the drain ends with a deferred self-update never applied.
+
+        Issue #944: another run on the host can outlast a one-shot drain. The
+        drain does not wait for it (that run could hold it open indefinitely).
+        """
+        if not self._pending_self_update:
+            return
+        self._echo(
+            f"self-update not applied: sdlc runs still active on this host "
+            f"({', '.join(self._self_update_blockers) or 'unknown'}); re-run "
+            f"`sdlc queue run --self-update` once they finish"
+        )
 
     def _pass(self) -> bool:
         """One turn of the loop; True when the drain is done."""

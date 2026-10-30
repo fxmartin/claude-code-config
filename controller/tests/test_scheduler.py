@@ -2811,6 +2811,9 @@ def test_self_update_defers_while_another_host_run_is_active(tmp_path) -> None:
     deferred = [line for line in lines if "self-update deferred" in line]
     assert len(deferred) == 1, "announced once, not on every poll"
     assert "other-run" in deferred[0]
+    dropped = [line for line in lines if "self-update not applied" in line]
+    assert len(dropped) == 1, "a one-shot drain says at exit that the update was dropped"
+    assert "sdlc queue run --self-update" in dropped[0]
 
 
 def test_self_update_applies_at_the_boundary_after_the_other_run_ends(tmp_path) -> None:
