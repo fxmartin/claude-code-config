@@ -172,8 +172,8 @@ Claude Code). The plugin half needs a Claude Code restart to take effect.
 Installing the controller replaces the tool's environment under every `sdlc` run
 on the machine, so `deploy.sh` refuses while `sdlc runs --active` lists any; wait
 for them, or pass `--force`. A run that sees the install change anyway parks its
-stories `needs_attention` for `sdlc resume` instead of crashing, and `sdlc doctor`
-warns about a live run older than the install.
+stories `needs_attention` for `sdlc resume --run <id>` instead of crashing, and
+`sdlc doctor` warns about a live run older than the install.
 
 #### Key subcommands
 

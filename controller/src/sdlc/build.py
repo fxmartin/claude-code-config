@@ -1974,7 +1974,7 @@ def _park_on_reinstall(
             if not install_guard.is_reinstall_crash(exc):
                 raise
     ledger.event_log(
-        run_id, story_id, "warn", "controller", install_guard.REINSTALL_PARK_MESSAGE,
+        run_id, story_id, "warn", "controller", install_guard.park_message(run_id),
     )
     return _StoryRunOutcome(status="NEEDS_ATTENTION")
 
@@ -9322,7 +9322,7 @@ def _run_story(
         if install_guard.reinstalled():
             ledger.event_log(
                 run_id, story.id, "warn", "controller",
-                install_guard.REINSTALL_PARK_MESSAGE,
+                install_guard.park_message(run_id),
             )
             return "NEEDS_ATTENTION"
         # Story 22.4-002: post a live status comment/label on the story's issue as

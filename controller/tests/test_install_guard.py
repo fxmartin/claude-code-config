@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import pkgutil
+import re
 import sqlite3
 import sys
 from importlib.metadata import PackageNotFoundError
@@ -16,7 +17,7 @@ import sdlc
 from sdlc import build as build_mod
 from sdlc import install_guard
 from sdlc.build import BuildOptions, Ledger, run_build
-from sdlc.fix_issue import FixOptions, run_fix
+from sdlc.fix_issue import FixOptions, resume_fix, run_fix
 from sdlc.registry import Registry
 from sdlc import resume as resume_mod
 from sdlc.resume import run_resume
@@ -25,7 +26,10 @@ from test_build import FakeDispatcher, _story
 from test_fix_issue import FakeGh, RecordingDispatcher, _issue_json
 from test_resume import _make_project, _seed_interrupted
 
-HINT = "controller reinstalled mid-run — run `sdlc resume`"
+
+def _hint(db: Path) -> str:
+    run_id = Ledger(db).latest_run_id()
+    return f"controller reinstalled mid-run — run `sdlc resume --run {run_id}`"
 
 
 class _FakeInstall:
@@ -219,7 +223,7 @@ def test_a_marker_change_mid_story_parks_it_with_the_resume_hint(
     )
 
     assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
-    assert HINT in _events(db)
+    assert _hint(db) in _events(db)
     # The stage after the swap never started on the mixed install.
     assert [agent for agent, _ in disp.calls].count("build") == 1
     assert "review" not in [agent for agent, _ in disp.calls]
@@ -264,7 +268,7 @@ def test_an_import_error_from_the_swap_parks_instead_of_failing(
     )
 
     assert result.story_status["99.1-001"] == "NEEDS_ATTENTION"
-    assert HINT in _events(db)
+    assert _hint(db) in _events(db)
     assert not [e for e in _events(db) if "No module named" in e and "raised" in e]
 
 
@@ -305,7 +309,7 @@ def test_a_marker_change_during_resume_parks_again(
 
     assert "NEEDS_ATTENTION" in result.story_status.values()
     assert "FAILED" not in result.story_status.values()
-    assert HINT in _events(db)
+    assert _hint(db) in _events(db)
     assert "merge" not in [agent for agent, _ in dispatch.calls]
 
 
@@ -327,7 +331,50 @@ def test_an_import_error_from_the_swap_parks_a_resumed_story(
     )
 
     assert "FAILED" not in result.story_status.values()
-    assert HINT in _events(db)
+    assert _hint(db) in _events(db)
+
+
+# --- following the hint -------------------------------------------------------
+
+
+def _hinted_run_id(db: Path) -> str:
+    """The run id the park event names: what an operator actually copies."""
+    hints = [e for e in _events(db) if e.startswith("controller reinstalled mid-run")]
+    return re.search(r"`sdlc resume --run (\S+)`", hints[-1]).group(1)
+
+
+def _on_a_new_process(monkeypatch) -> None:
+    """The resume is a fresh `sdlc` on the new install: nothing armed yet."""
+    monkeypatch.setattr(install_guard, "_armed", None)
+
+
+@pytest.mark.parametrize("swap_after", ["build", "merge"])
+def test_the_park_hint_takes_a_parked_run_to_done(
+    tmp_path, install, monkeypatch, swap_after
+) -> None:
+    root = _make_project(tmp_path)
+    monkeypatch.chdir(root)
+    db = root / ".sdlc-state.db"
+    registry = Registry(tmp_path / "registry.json")
+
+    parked = run_build(
+        _opts(sequential=True), queue=[_story("99.1-001"), _story("99.1-002")],
+        ledger=Ledger(db), dispatcher=_ReinstallAfter(install, swap_after),
+        preflight=lambda: True, root=root, registry=registry,
+    )
+    assert "NEEDS_ATTENTION" in parked.story_status.values()
+    # Why the hint names the run: a bare `sdlc resume` never picks a closed one.
+    assert Ledger(db).latest_resumable_run("all") is None
+
+    _on_a_new_process(monkeypatch)
+    resumed = run_resume(  # "all" is the CLI default beside --run
+        "all", run_id=_hinted_run_id(db), ledger=Ledger(db),
+        dispatcher=FakeDispatcher(), root=root, registry=registry,
+    )
+
+    assert resumed.nothing_to_resume is False
+    assert set(resumed.story_status.values()) == {"DONE"}
+    assert Ledger(db).run_row(parked.run_id)["status"] == "DONE"
 
 
 # --- run_fix ------------------------------------------------------------------
@@ -342,25 +389,44 @@ def _fix(tmp_path, dispatch) -> tuple:
     return result, db
 
 
+class _SwappingAfterBuild:
+    """A fix dispatcher that swaps the install once the build has run."""
+
+    def __init__(self, install: _FakeInstall, dispatch: RecordingDispatcher) -> None:
+        self._install = install
+        self._dispatch = dispatch
+
+    def __call__(self, agent_type, *args, **kwargs):
+        result = self._dispatch(agent_type, *args, **kwargs)
+        if agent_type == "build":
+            self._install.swap()
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._dispatch, name)
+
+
 def test_a_marker_change_mid_fix_parks_with_the_resume_hint(tmp_path, install) -> None:
     dispatch = RecordingDispatcher()
-    inner = dispatch.__call__
 
-    class _Swapping:
-        def __call__(self, agent_type, *args, **kwargs):
-            result = inner(agent_type, *args, **kwargs)
-            if agent_type == "build":
-                install.swap()
-            return result
-
-        def __getattr__(self, name):
-            return getattr(dispatch, name)
-
-    result, db = _fix(tmp_path, _Swapping())
+    result, db = _fix(tmp_path, _SwappingAfterBuild(install, dispatch))
 
     assert result.status == "NEEDS_ATTENTION"
-    assert HINT in _events(db)
+    assert _hint(db) in _events(db)
     assert "merge" not in dispatch.agents()
+
+
+def test_the_park_hint_takes_a_parked_fix_to_done(tmp_path, install, monkeypatch) -> None:
+    parked, db = _fix(tmp_path, _SwappingAfterBuild(install, RecordingDispatcher()))
+    assert parked.status == "NEEDS_ATTENTION"
+
+    _on_a_new_process(monkeypatch)
+    resumed = resume_fix(
+        _hinted_run_id(db), ledger=Ledger(db), dispatcher=RecordingDispatcher(),
+        runner=FakeGh(_issue_json()), root=tmp_path,
+    )
+
+    assert resumed.status == "DONE"
 
 
 def test_an_import_error_from_the_swap_parks_a_fix(tmp_path, install, monkeypatch) -> None:
@@ -374,7 +440,27 @@ def test_an_import_error_from_the_swap_parks_a_fix(tmp_path, install, monkeypatc
     result, db = _fix(tmp_path, RecordingDispatcher())
 
     assert result.status == "NEEDS_ATTENTION"
-    assert HINT in _events(db)
+    assert _hint(db) in _events(db)
+
+
+def test_a_fix_parked_by_an_import_error_keeps_the_pr_its_loop_opened(
+    tmp_path, install, monkeypatch
+) -> None:
+    from sdlc import fix_issue
+
+    def crash(*_args, **_kwargs):
+        raise ModuleNotFoundError("No module named 'sdlc.parsers'", name="sdlc.parsers")
+
+    monkeypatch.setattr(fix_issue, "_fix_change_class", crash)
+    dispatch = RecordingDispatcher(overrides={"build": {
+        "branch_name": "feature/issue-1", "build_status": "SUCCESS",
+        "commit_sha": "deadbeef", "pr_number": 100,
+    }})
+
+    result, _db = _fix(tmp_path, dispatch)
+
+    assert result.status == "NEEDS_ATTENTION"
+    assert result.pr_number == 100  # run_fix calls the loop with no pr_number at all
 
 
 def test_an_unrelated_import_error_is_not_swallowed_by_the_fix_park(

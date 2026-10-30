@@ -1707,9 +1707,13 @@ def _parks_on_reinstall(stage_loop):
                 raise
             ledger.event_log(
                 run_id, story.id, "warn", "controller",
-                install_guard.REINSTALL_PARK_MESSAGE,
+                install_guard.park_message(run_id),
             )
-            return "NEEDS_ATTENTION", kwargs.get("pr_number")
+            # The ledger, not the argument: the loop may have opened the PR itself.
+            row: dict = next(
+                (r for r in ledger.story_rows(run_id) if r["story_id"] == story.id), {}
+            )
+            return "NEEDS_ATTENTION", row.get("pr_number")
 
     return wrapper
 
@@ -1788,7 +1792,7 @@ def _run_stage_loop(
         if install_guard.reinstalled():
             ledger.event_log(
                 run_id, story.id, "warn", "controller",
-                install_guard.REINSTALL_PARK_MESSAGE,
+                install_guard.park_message(run_id),
             )
             return "NEEDS_ATTENTION", pr_number
         # Story 27.2-003: classify once, post-build, when the first gated stage is

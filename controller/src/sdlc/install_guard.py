@@ -11,18 +11,24 @@ from pathlib import Path
 import sdlc
 
 __all__ = [
-    "REINSTALL_PARK_MESSAGE",
     "arm",
     "install_marker",
     "is_reinstall_crash",
+    "park_message",
     "reinstalled",
 ]
 
-# The event every parked story carries. `sdlc resume` re-enters it on the new code.
-REINSTALL_PARK_MESSAGE = "controller reinstalled mid-run — run `sdlc resume`"
-
 # The marker this process started on; None until armed, or with no readable install.
 _armed: tuple[str, int] | None = None
+
+
+def park_message(run_id: str) -> str:
+    """The event every parked story carries, naming the command that re-enters it.
+
+    It names the run because a parked run closes ``NEEDS_ATTENTION``, which a bare
+    `sdlc resume` deliberately never picks (:meth:`Ledger.latest_resumable_run`).
+    """
+    return f"controller reinstalled mid-run — run `sdlc resume --run {run_id}`"
 
 
 def install_marker() -> tuple[str, int] | None:

@@ -422,6 +422,8 @@ ACTIVE="48c748ba 01.1-002 pid 4242 /work/bootstrap-dev-server"
     [ "$status" -ne 0 ]
     [[ "$output" == *"48c748ba"* ]]
     [[ "$output" == *"--force"* ]]
+    # A bare `sdlc resume` skips a parked run: the advice has to name it.
+    [[ "$output" == *"sdlc resume --run"* ]]
     [ ! -e "${CONTROLLER_MARKER}" ]
     [ ! -e "${PLUGIN_MARKER}" ]
     [ ! -e "${SANDBOX_MARKER}" ]

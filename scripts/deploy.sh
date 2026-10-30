@@ -39,7 +39,7 @@
 # Installing the controller swaps the tool's environment under every sdlc run on
 # this host (issue #944), so a deploy that would install it refuses while `sdlc
 # runs --active` lists any, naming them, with the machine untouched. Wait for them
-# or pass --force; a forced run's stories park needs_attention for `sdlc resume`.
+# or pass --force; a forced run parks needs_attention for `sdlc resume --run <id>`.
 #
 # A default run REQUIRES `claude` on PATH. It is checked in preflight, before
 # anything is installed, so a box without Claude Code aborts with the machine
@@ -81,7 +81,7 @@ DRY_RUN=false
 FORCE=false
 
 usage() {
-  sed -n '6,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '6,54p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 log() { printf '==> %s\n' "$*"; }
@@ -173,7 +173,7 @@ if [[ "${DO_CONTROLLER}" == true ]]; then
       die "active sdlc runs on this host; installing the controller would crash them:
 ${ACTIVE_RUNS}
        Nothing was changed. Wait for them to finish, or pass --force and
-       \`sdlc resume\` their parked stories."
+       \`sdlc resume --run <id>\` each one from its repo once it parks."
     fi
   fi
 fi

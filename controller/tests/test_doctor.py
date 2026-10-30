@@ -2434,7 +2434,7 @@ def test_doctor_warns_when_the_install_is_newer_than_a_live_run(tmp_path) -> Non
 
     assert finding.status == "WARN"
     assert "48c748ba" in finding.detail and "2.126.0" in finding.detail
-    assert "sdlc resume" in finding.remedy
+    assert "sdlc resume --run" in finding.remedy
 
 
 @pytest.mark.parametrize("version", ["2.126.1", "2.127.0", None])

@@ -1781,7 +1781,8 @@ def check_run_versions(registry: Registry, *, installed_version: str | None = No
     return Finding(
         "runs", name, "WARN",
         f"installed {installed} is newer than live run(s): {', '.join(behind)}",
-        "expect their stories to park needs_attention, then run: sdlc resume",
+        "expect their stories to park needs_attention, then, in each run's repo, "
+        "run: sdlc resume --run <id>",
     )
 
 
