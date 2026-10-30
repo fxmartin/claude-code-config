@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: COMPLETE (38/38)** — 35.1-005 and 35.5-011 merged 2026-10-29 (job 47, #931/#932); 35.1-005 (a broken `tailscale whois` reads as unavailable, issue #833) and 35.5-011 (`sdlc fix` runs in its own worktree, issue #799) added 2026-10-29; 35.2-010 and 35.5-010 merged 2026-10-28..29 (jobs 46 and 45, #926/#925, v2.122.0+); 35.5-010 (reconcile on a worker leaves its clone clean) added 2026-10-28 from job 44's `DIRTY_WORKING_TREE` hold; 35.5-007, 35.5-008 and 35.5-009 merged 2026-10-28 (job 44, #920/#919/#921, v2.119.0–v2.121.0); 35.5-007 (a bugfix that only re-ran CI re-checks the merge gate), 35.5-008 (reconcile from an SSH shell reaches the fleet queue) and 35.5-009 (controller tests pass inside an agent worktree) added 2026-10-28 from fleet job 43; 35.2-013 and 35.2-014 merged 2026-10-28 (job 43, #910/#911, v2.117.0/v2.118.0); 35.2-013 (a failed worker self-check names the real error) and 35.2-014 (doctor warns when a Mac worker's Keychain can lock) added 2026-10-28 from the home-lab worker going offline after the v2.116.0 deploy; 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (38/39)** — 35.2-015 (a repo that builds only on Linux never lands on a Mac worker) added 2026-10-30 from fleet job 49; 35.1-005 and 35.5-011 merged 2026-10-29 (job 47, #931/#932); 35.1-005 (a broken `tailscale whois` reads as unavailable, issue #833) and 35.5-011 (`sdlc fix` runs in its own worktree, issue #799) added 2026-10-29; 35.2-010 and 35.5-010 merged 2026-10-28..29 (jobs 46 and 45, #926/#925, v2.122.0+); 35.5-010 (reconcile on a worker leaves its clone clean) added 2026-10-28 from job 44's `DIRTY_WORKING_TREE` hold; 35.5-007, 35.5-008 and 35.5-009 merged 2026-10-28 (job 44, #920/#919/#921, v2.119.0–v2.121.0); 35.5-007 (a bugfix that only re-ran CI re-checks the merge gate), 35.5-008 (reconcile from an SSH shell reaches the fleet queue) and 35.5-009 (controller tests pass inside an agent worktree) added 2026-10-28 from fleet job 43; 35.2-013 and 35.2-014 merged 2026-10-28 (job 43, #910/#911, v2.117.0/v2.118.0); 35.2-013 (a failed worker self-check names the real error) and 35.2-014 (doctor warns when a Mac worker's Keychain can lock) added 2026-10-28 from the home-lab worker going offline after the v2.116.0 deploy; 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 38 | **Total Points**: 122 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 39 | **Total Points**: 125 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -966,6 +966,68 @@ runner so tests never call `security`.
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.2-009
+**Risk Level**: Low
+
+##### Story 35.2-015: A repo that builds only on Linux never lands on a Mac worker
+**User Story**: As FX, I want a repo to declare the platforms its suite
+passes on, and the fleet to send its jobs only to a worker on one of them,
+so that a Linux-only repo never burns a job failing preflight on a Mac.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** a repo whose `.sdlc-forge.yaml` declares `platforms: [linux]`
+  **When** `sdlc build --enqueue` or `sdlc fix --enqueue` records the job
+  **Then** the job's requirements carry `platform: linux`.
+- **Given** a worker **When** it registers or heartbeats **Then** it
+  advertises its platform (`platform.system().lower()`: `darwin` or
+  `linux`), and `sdlc queue workers` shows it.
+- **Given** a job requiring `linux` and only `darwin` workers online
+  **When** a worker polls **Then** none claims it, and `sdlc queue list`
+  names the unmet need `platform linux`.
+- **Given** the same job pinned with `--host m3max` (a `darwin` worker)
+  **When** it is enqueued **Then** the enqueue is refused before the job is
+  recorded, naming the repo's platforms and the worker's, with the hint to
+  build locally (`sdlc build <scope> --auto`) or pick a matching host.
+- **Given** no registered worker has a declared platform **When** the job
+  is enqueued without `--host` **Then** it is still recorded, and the
+  enqueue warns that no worker can run it yet.
+- **Given** a repo with no `platforms` key, or a worker that predates this
+  story and never advertised a platform **When** jobs are matched **Then**
+  behaviour is unchanged: any platform may run it.
+- **Given** agentic-coding-monitor **When** this story lands **Then** its
+  `.sdlc-forge.yaml` declares `platforms: [linux]` (a one-line MR on GitLab,
+  outside this repo's PR).
+
+**Technical Notes**: Fleet job 49 (build 15.1-004 in agentic-coding-monitor,
+2026-10-30) was claimed by the M3 Max and failed `PRE_FLIGHT_RED` after
+about ten minutes: `make test` fails on macOS by design. The voice tests stop
+with `voice unavailable: unsupported on darwin`, the runtime-dir and socket
+tests assume `XDG_RUNTIME_DIR`, and `cmd/acmd`
+`TestRunFailsWithoutRuntimeDir` hangs to the 600 s test timeout. Both fleet
+workers are Macs, so no acm job can succeed on the fleet; FX built it
+locally on the XPS instead.
+- Requirements are built in `cli.py` `_job_requirements`; add `platform`
+  there from the repo file, read with the existing `.sdlc-forge.yaml`
+  loader in `issue_host.py` (`FORGE_OVERRIDE_FILENAME`, Story 30.1-001).
+- Matching is `job_needs` in `queue.py`: add a `platform` need beside
+  `harness`/`sandbox`; a worker whose `platform` is `None` satisfies it
+  (back-compat, like an unreported forge in 35.2-006).
+- `WorkerRecord` gains `platform: str | None`; the `workers` table needs a
+  column through `_MIGRATIONS` (renumber against `main` before finishing —
+  parallel stories have collided on migration numbers before).
+- The `--host` refusal reads the registered worker's platform from the queue
+  service; an unknown worker is already refused by 35.3-001.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: requirement recorded from the repo file; `darwin` worker skips
+      a `linux` job and `queue list` names the need; `--host` on a mismatched
+      worker refused before recording; no `platforms` key or no advertised
+      platform → unchanged matching; migration adds the column
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-003, 35.3-001
 **Risk Level**: Low
 
 ### Feature 35.3: Launch from the XPS
