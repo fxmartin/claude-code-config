@@ -6990,12 +6990,12 @@ def _unpushed_commits(root: Path, branch: str) -> tuple[int, str]:
         remote = f"refs/remotes/origin/{branch}"
         # Issue #938: an untracked branch is counted against origin's default
         # branch, not a possibly stale local main (which inflated the count).
-        floor = (
+        floor: str | None = (
             remote
             if _git(root, "rev-parse", "--verify", "--quiet", remote).returncode == 0
             else _origin_default_ref(root)
         )
-        if _git(root, "rev-parse", "--verify", "--quiet", floor).returncode != 0:
+        if floor is None or _git(root, "rev-parse", "--verify", "--quiet", floor).returncode != 0:
             floor = _base_ref(root)
         if floor is None:
             return 0, ""
