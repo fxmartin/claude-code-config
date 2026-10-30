@@ -154,6 +154,20 @@ def test_unpushed_commits_on_never_pushed_branch_counts_from_base(tmp_path) -> N
     assert _unpushed_commits(work, "feature/fresh") == (1, sha)
 
 
+def test_unpushed_commits_untracked_branch_ignores_a_stale_local_main(tmp_path) -> None:
+    """Issue #938: the count equals ``origin/main..HEAD``, not ``main..HEAD``."""
+    work = _repo(tmp_path)
+    _git(work, "checkout", "main")
+    for i in range(4):
+        _commit(work, f"m{i}.txt")
+    _git(work, "push", "origin", "main")
+    _git(work, "checkout", "-b", "feature/fresh", "origin/main")
+    _commit(work, "mine.txt")
+    _git(work, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    _git(work, "branch", "-f", "main", "main~4")  # local main lags origin/main
+    assert _unpushed_commits(work, "feature/fresh")[0] == 1
+
+
 # ---------------------------------------------------------------------------
 # AC1 — FIXED + not green + ahead: push, then CI adjudicates
 # ---------------------------------------------------------------------------

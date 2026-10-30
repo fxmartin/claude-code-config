@@ -5292,3 +5292,40 @@ def test_build_prompt_omits_comments() -> None:
     from sdlc.fix_issue import _untrusted_block
     issue = FixIssue(1, "t", "b", "open", (), (), comments=(_c("fx", "OWNER", "hi"),))
     assert "Issue comments" not in _untrusted_block(issue, include_body=True)
+
+
+def test_fix_merge_bugfix_is_pushed_before_the_regate(tmp_path, monkeypatch) -> None:
+    """Issue #938: the FIXED merge bugfix reaches origin, and the next gate
+    is told which head it must see, before the gate re-reads the pipeline."""
+    import sdlc.fix_issue as fix_mod
+    from sdlc.issue_host import CR_FAILED, CR_SUCCESS
+
+    _stub_cr_status(monkeypatch, [CR_FAILED, CR_SUCCESS])
+    order: list[str] = []
+    real_gate = fix_mod._run_merge_ci_gate
+
+    def _gate(*args, **kwargs):
+        if args[0] == "merge":
+            order.append(f"gate:{kwargs.get('expected_sha')}")
+        return real_gate(*args, **kwargs)
+
+    def _push(story, workdir, ledger, run_id, **kw):
+        order.append("push")
+        return True
+
+    monkeypatch.setattr(fix_mod, "_run_merge_ci_gate", _gate)
+    monkeypatch.setattr(fix_mod, "_push_bugfix_commit", _push)
+    monkeypatch.setattr(fix_mod, "_local_branch_sha", lambda root, branch: "abc123")
+    result = _run_gated_fix(tmp_path, RecordingDispatcher())
+    assert result.status == "DONE"
+    assert order[:3] == ["gate:None", "push", "gate:abc123"]
+
+
+def test_fix_merge_bugfix_push_failure_parks_needs_attention(tmp_path, monkeypatch) -> None:
+    import sdlc.fix_issue as fix_mod
+    from sdlc.issue_host import CR_FAILED
+
+    _stub_cr_status(monkeypatch, [CR_FAILED])
+    monkeypatch.setattr(fix_mod, "_push_bugfix_commit", lambda *a, **k: False)
+    result = _run_gated_fix(tmp_path, RecordingDispatcher())
+    assert result.status == "NEEDS_ATTENTION"

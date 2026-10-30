@@ -5786,6 +5786,11 @@ def _ci_status_lookup(ledger: "Ledger", story_id: str, pr_number: int) -> str | 
     return build_issue.change_request_status(ledger, story_id, pr_number)
 
 
+def _ci_head_sha_lookup(ledger: "Ledger", story_id: str, pr_number: int) -> str | None:
+    """The sha of the CR's reported pipeline (the test seam for issue #938)."""
+    return build_issue.change_request_head_sha(ledger, story_id, pr_number)
+
+
 def _poll_cr_status(
     status_fn: Callable[[], str | None],
     *,
@@ -5869,6 +5874,8 @@ def _run_merge_ci_gate(
     sleep_fn: Callable[[float], None] | None = None,
     clock: Callable[[], float] | None = None,
     repo_root: Path | None = None,
+    expected_sha: str | None = None,
+    head_sha_fn: Callable[[], str | None] | None = None,
 ) -> _MergeCIGate | None:
     """Poll the merge stage's CR pipeline and decide whether the merge may proceed.
 
@@ -5886,6 +5893,12 @@ def _run_merge_ci_gate(
     :data:`_CI_REGISTRATION_GRACE_S` of the first poll is read as "checks not
     registered yet" and polled like :data:`CR_PENDING`, so a just-pushed head is
     never merged as if the repo had no CI.
+
+    ``expected_sha`` (issue #938) is the head the controller just pushed: a
+    pipeline the host reports for any other sha is stale and polled as
+    :data:`CR_PENDING`, so a bugfix commit is never gated on its parent's result
+    and an unreachable pipeline times out loudly. A host that reports no sha
+    keeps the status-only behaviour.
     """
     if stage != "merge" or pr_number is None:
         return None
@@ -5898,9 +5911,22 @@ def _run_merge_ci_gate(
         return _ci_status_lookup(ledger, story.id, pr_number)
 
     raw_status_fn = status_fn or _default_status
+    stale_sha: list[str] = []
+
+    def _default_head_sha() -> str | None:
+        return _ci_head_sha_lookup(ledger, story.id, pr_number)
+
+    head_sha_fn = head_sha_fn or _default_head_sha
 
     def _gated_status() -> str | None:
         status = raw_status_fn()
+        if expected_sha and status in (CR_SUCCESS, CR_FAILED):
+            seen = head_sha_fn()
+            if seen is not None and seen != expected_sha:
+                # Issue #938: a finished pipeline for an older head says nothing
+                # about the pushed one — wait for the right pipeline to appear.
+                stale_sha[:] = [seen]
+                return CR_PENDING
         if status is None and opts.ci_gate_timeout_s > 0:
             # Issue #731: tolerate a transient host error with a short, bounded
             # retry. `--ci-gate-timeout 0` is a single read by contract: no retry.
@@ -5935,6 +5961,11 @@ def _run_merge_ci_gate(
     # Issue #731 supersedes #699's policy branch: a failed lookup blocks on any
     # repo, declared forge or not. `--ci-gate-no-ci` keeps governing CR_NONE.
     verdict, reason = _evaluate_ci_gate(status, no_ci_policy=opts.ci_gate_no_ci)
+    if stale_sha and status == CR_PENDING and expected_sha:
+        reason = (
+            f"no pipeline for pushed head {expected_sha[:12]} after {int(waited)}s "
+            f"(CR pipeline is on {stale_sha[0][:12]}) — {reason}"
+        )
     if status == CR_NONE and ci_configured:
         reason = (
             f"no checks registered on the CR head after {int(waited)}s although the "
@@ -6957,7 +6988,15 @@ def _unpushed_commits(root: Path, branch: str) -> tuple[int, str]:
         if tip.returncode != 0:
             return 0, ""
         remote = f"refs/remotes/origin/{branch}"
-        floor = remote if _git(root, "rev-parse", "--verify", "--quiet", remote).returncode == 0 else _base_ref(root)
+        # Issue #938: an untracked branch is counted against origin's default
+        # branch, not a possibly stale local main (which inflated the count).
+        floor: str | None = (
+            remote
+            if _git(root, "rev-parse", "--verify", "--quiet", remote).returncode == 0
+            else _origin_default_ref(root)
+        )
+        if floor is None or _git(root, "rev-parse", "--verify", "--quiet", floor).returncode != 0:
+            floor = _base_ref(root)
         if floor is None:
             return 0, ""
         ahead = _git(root, "rev-list", "--count", f"{floor}..refs/heads/{branch}")
@@ -9463,6 +9502,7 @@ def _run_story(
                 opts,
             )
         regated = False  # issue #794: one merge re-gate per stage
+        pushed_bugfix_head: str | None = None  # issue #938: head the next gate must see
         pushed_fix: _PushedFix | None = None  # story 35.5-001: a fix already on origin
         ci_rerun_green = False  # story 35.5-007: a no-commit round's re-gate was green
         while True:
@@ -9556,7 +9596,9 @@ def _run_story(
                 gate = _run_merge_ci_gate(
                     stage, ledger, run_id, story, pr_number, opts,
                     repo_root=workdir or Path.cwd(),
+                    expected_sha=pushed_bugfix_head,
                 )
+                pushed_bugfix_head = None
                 if gate is not None and gate.verdict == _GATE_BLOCK:
                     ok, result, failure, kind = False, None, gate.reason, "ci-gate"
                 else:
@@ -9877,6 +9919,10 @@ def _run_story(
                         coverage_signals, cr_terms, opts,
                     )
                 # Bugfix succeeded — retry the same stage as a new attempt.
+                if stage == "merge":
+                    pushed_bugfix_head = _local_branch_sha(
+                        workdir or Path.cwd(), f"feature/{story.id}"
+                    )
                 attempt += 1
             except ContextOverflowError as exc:
                 # Issue #104: the agent's prompt exceeded the model context

@@ -940,6 +940,15 @@ class IssueHostAdapter(ABC):
         :data:`CR_UNKNOWN`. The merge gate (Story 23.2-002) polls this.
         """
 
+    def cr_head_pipeline_sha(self, ref: "str | ChangeRequest") -> str | None:
+        """The commit sha the change request's CI pipeline ran on, or None.
+
+        Issue #938: lets the merge gate refuse a pipeline for a stale head.
+        Deliberately **not** abstract: a host that does not expose the sha
+        returns None and the gate keeps reading the status alone.
+        """
+        return None
+
     def cr_checks(self, ref: "str | ChangeRequest") -> ChangeRequestChecks:
         """Return a change request's labels and named per-check statuses.
 
@@ -1577,6 +1586,13 @@ class GitLabAdapter(IssueHostAdapter):
         pipeline = row.get("pipeline") or row.get("head_pipeline")
         raw = pipeline.get("status") if isinstance(pipeline, dict) else None
         return _gitlab_pipeline_status(raw)
+
+    def cr_head_pipeline_sha(self, ref: "str | ChangeRequest") -> str | None:
+        out = self._run("mr", "view", _cr_ref_of(ref), "--output", "json").stdout
+        row = _parse_json_object(out)
+        pipeline = row.get("pipeline") or row.get("head_pipeline")
+        sha = pipeline.get("sha") if isinstance(pipeline, dict) else None
+        return str(sha) if sha else None
 
     def cr_checks(self, ref: "str | ChangeRequest") -> ChangeRequestChecks:
         out = self._run("mr", "view", _cr_ref_of(ref), "--output", "json").stdout
