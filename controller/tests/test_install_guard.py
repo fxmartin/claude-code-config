@@ -375,3 +375,17 @@ def test_an_import_error_from_the_swap_parks_a_fix(tmp_path, install, monkeypatc
 
     assert result.status == "NEEDS_ATTENTION"
     assert HINT in _events(db)
+
+
+def test_an_unrelated_import_error_is_not_swallowed_by_the_fix_park(
+    tmp_path, install, monkeypatch
+) -> None:
+    from sdlc import fix_issue
+
+    def crash(*_args, **_kwargs):
+        raise ModuleNotFoundError("No module named 'yaml'", name="yaml")
+
+    monkeypatch.setattr(fix_issue, "_fix_change_class", crash)
+
+    with pytest.raises(ModuleNotFoundError):
+        _fix(tmp_path, RecordingDispatcher())
