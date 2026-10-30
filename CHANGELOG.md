@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.127.0] - 2026-10-30
+
+### Added
+
+- feat(fleet-execution): a repo that builds only on linux (#35.2-015)
+
+### Fixed
+
+- fix(fleet-execution): a repo that builds only on linux (#35.2-015)
+
+
 ## [v2.126.1] - 2026-10-30
 
 ### Fixed
