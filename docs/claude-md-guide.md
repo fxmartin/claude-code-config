@@ -236,6 +236,16 @@ Opens with the story-driven-development paragraph, then:
 
 **The Agents + Skills inventory** is worth calling out as an anti-pattern you avoided: you *could* duplicate each agent's full description here. You don't. You just name them. Sub-agents' full descriptions live in `agents/*.md` — CLAUDE.md just orients Claude to what's available. This is the right depth: enough that Claude knows to dispatch `ui-engineer` for frontend work, not so much that the list swallows the file.
 
+### Section 4b: Piloting the SDLC
+
+Five rules for driving the `sdlc` controller, each pointing at a guard rail the controller already has: look before acting, front door only, never nest, one live run per repo, and long runs are not tool calls.
+
+**What it solves:** an agent otherwise learns the controller exists only when a skill fires. A session that wants to check or start a run has no orientation, and a dispatched agent has no reason to know it must not start one.
+
+**Why it lives in both files:** like `## Machines`, the block is byte-identical in `CLAUDE.md` and `AGENTS.md`, and `tests/sdlc-piloting-section.bats` enforces that parity, the five rule markers, and a 20-line cap so it stays a pointer rather than a manual.
+
+**Why not an MCP server:** considered and deferred until a non-skill consumer (OpenClaw, Desktop) exists. `build` and `fix` run for hours and do not fit tool-call semantics, and the generated thin-wrapper skills already are the cross-harness invocation layer.
+
 ### Section 5: Reference Materials (the link-out layer)
 
 ```markdown
