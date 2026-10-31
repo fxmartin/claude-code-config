@@ -815,3 +815,11 @@ def test_investigation_files_to_modify_empty_array_is_valid() -> None:
     data = dict(VALID_RESPONSES["investigation"])
     data["files_to_modify"] = []
     assert validate_response("investigation", data) == data
+
+
+def test_coverage_null_pr_fields_accepted() -> None:
+    """The controller opens the CR (27.3-001), so an agent may report pr_number/pr_url as null."""
+    data = dict(VALID_RESPONSES["coverage"])
+    data["pr_number"] = None
+    data["pr_url"] = None
+    assert validate_response("coverage", data) == data

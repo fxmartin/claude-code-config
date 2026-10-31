@@ -5921,8 +5921,10 @@ def _run_merge_ci_gate(
     ``expected_sha`` (issue #938) is the head the controller just pushed: a
     pipeline the host reports for any other sha is stale and polled as
     :data:`CR_PENDING`, so a bugfix commit is never gated on its parent's result
-    and an unreachable pipeline times out loudly. A host that reports no sha
-    keeps the status-only behaviour.
+    and an unreachable pipeline times out loudly. Issue #947: ``""`` means "a
+    push happened but its head is unreadable" and ``None`` "no push"; after a
+    push an unreadable head or pipeline sha is never trusted — the gate polls
+    as pending until the timeout, then blocks.
     """
     if stage != "merge" or pr_number is None:
         return None
@@ -5944,12 +5946,26 @@ def _run_merge_ci_gate(
 
     def _gated_status() -> str | None:
         status = raw_status_fn()
-        if expected_sha and status in (CR_SUCCESS, CR_FAILED):
+        if expected_sha is not None and status in (CR_SUCCESS, CR_FAILED):
             seen = head_sha_fn()
-            if seen is not None and seen != expected_sha:
-                # Issue #938: a finished pipeline for an older head says nothing
-                # about the pushed one — wait for the right pipeline to appear.
-                stale_sha[:] = [seen]
+            if not expected_sha or seen is None or seen != expected_sha:
+                # Issue #938/#947: a finished pipeline for an older head says
+                # nothing about the pushed one — wait for the right pipeline to
+                # appear. Fail closed: an unreadable pushed head or pipeline sha
+                # is never trusted as a match (bounded by the gate timeout).
+                if not stale_sha:
+                    if not expected_sha:
+                        why = "pushed head unreadable after a bugfix push"
+                    elif seen is None:
+                        why = "pipeline sha unreadable after a bugfix push"
+                    else:
+                        why = f"pipeline is on {seen[:12]}, not the pushed head"
+                    ledger.event_log(
+                        run_id, story.id, "warn", "controller",
+                        f"merge CI gate: {why} — treating status as pending "
+                        f"(cr=#{pr_number})",
+                    )
+                stale_sha[:] = [seen or ""]
                 return CR_PENDING
         if status is None and opts.ci_gate_timeout_s > 0:
             # Issue #731: tolerate a transient host error with a short, bounded
@@ -5985,10 +6001,11 @@ def _run_merge_ci_gate(
     # Issue #731 supersedes #699's policy branch: a failed lookup blocks on any
     # repo, declared forge or not. `--ci-gate-no-ci` keeps governing CR_NONE.
     verdict, reason = _evaluate_ci_gate(status, no_ci_policy=opts.ci_gate_no_ci)
-    if stale_sha and status == CR_PENDING and expected_sha:
+    if stale_sha and status == CR_PENDING and expected_sha is not None:
         reason = (
-            f"no pipeline for pushed head {expected_sha[:12]} after {int(waited)}s "
-            f"(CR pipeline is on {stale_sha[0][:12]}) — {reason}"
+            f"no pipeline for pushed head {expected_sha[:12] or 'unknown'} "
+            f"after {int(waited)}s "
+            f"(CR pipeline is on {stale_sha[0][:12] or 'unknown'}) — {reason}"
         )
     if status == CR_NONE and ci_configured:
         reason = (
@@ -7037,6 +7054,15 @@ def _local_branch_sha(root: Path, branch: str) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return res.stdout.strip() or None if res.returncode == 0 else None
+
+
+def _pushed_head_sha(root: Path, branch: str) -> str:
+    """The head a bugfix push published; ``""`` (pushed, unreadable) when unknown.
+
+    Issue #947: never ``None`` — that would read as "no push" and let the merge
+    gate trust a stale pipeline status.
+    """
+    return _local_branch_sha(root, branch) or _remote_tracking_sha(root, branch) or ""
 
 
 def _remote_tracking_sha(root: Path, branch: str) -> str | None:
@@ -9956,7 +9982,7 @@ def _run_story(
                     )
                 # Bugfix succeeded — retry the same stage as a new attempt.
                 if stage == "merge":
-                    pushed_bugfix_head = _local_branch_sha(
+                    pushed_bugfix_head = _pushed_head_sha(
                         workdir or Path.cwd(), f"feature/{story.id}"
                     )
                 attempt += 1

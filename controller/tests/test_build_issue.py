@@ -740,6 +740,20 @@ def test_change_request_head_sha_reads_the_gitlab_pipeline_sha(tmp_path, monkeyp
     assert bi.change_request_head_sha(ledger, "29.4-004", 5, runner=runner) == "abc123"
 
 
+def test_github_head_pipeline_sha_is_the_pr_head_commit():
+    """Issue #947: GitHub's check rollup belongs to the PR head commit, so the
+    fail-closed merge gate can match it instead of timing out on every push."""
+    runner = FakeRunner({"pr view": (0, '{"headRefOid": "def456"}', "")})
+
+    assert ih.GitHubAdapter(runner=runner).cr_head_pipeline_sha("7") == "def456"
+
+
+def test_github_head_pipeline_sha_is_none_without_a_head_oid():
+    runner = FakeRunner({"pr view": (0, '{"headRefOid": ""}', "")})
+
+    assert ih.GitHubAdapter(runner=runner).cr_head_pipeline_sha("7") is None
+
+
 def test_change_request_head_sha_is_none_without_a_pipeline(tmp_path, monkeypatch):
     ledger = _never_mirrored_gitlab(tmp_path, monkeypatch)
     runner = FakeRunner({"mr view": (0, '{"head_pipeline": null}', "")})
