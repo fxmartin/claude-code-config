@@ -13,12 +13,12 @@
   ],
   "properties": {
     "pr_number": {
-      "type": "integer",
+      "type": ["integer", "null"],
       "minimum": 1,
       "description": "Pull request number, when the agent opened one. Optional since Story 27.3-001: the controller opens the change request deterministically after the coverage stage."
     },
     "pr_url": {
-      "type": "string",
+      "type": ["string", "null"],
       "format": "uri",
       "minLength": 1,
       "description": "URL of the pull request, when the agent opened one. Optional since Story 27.3-001."
