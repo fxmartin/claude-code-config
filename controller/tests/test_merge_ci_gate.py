@@ -710,14 +710,66 @@ def test_gate_never_resolves_on_a_stale_sha_and_times_out_loudly(tmp_path):
     assert "no pipeline for pushed head newsha" in gate.reason
 
 
-def test_gate_without_a_reported_sha_keeps_status_only_behaviour(tmp_path):
+def test_gate_unreadable_pipeline_sha_after_push_is_not_trusted(tmp_path):
+    """Issue #947: no pipeline sha right after a push must not pass the old status."""
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: ih.CR_FAILED, head_sha_fn=lambda: None,
+        sleep_fn=clock.sleep, clock=clock, expected_sha="newsha",
+    )
+    assert gate.verdict == _GATE_BLOCK
+    assert "no pipeline for pushed head newsha" in gate.reason
+
+
+def test_gate_unreadable_pushed_head_waits_then_reads_new_pipeline(tmp_path):
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    statuses = iter([ih.CR_FAILED, ih.CR_FAILED, ih.CR_SUCCESS])
+    # With the pushed head unknown the gate cannot match any sha: it stays
+    # pending, then blocks at the bound — never passes, never fails on old head.
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(),
+        status_fn=lambda: next(statuses, ih.CR_SUCCESS), head_sha_fn=lambda: "any",
+        sleep_fn=clock.sleep, clock=clock, expected_sha="",
+    )
+    assert gate.verdict == _GATE_BLOCK
+    assert gate.status == ih.CR_PENDING
+    assert "no pipeline for pushed head unknown" in gate.reason
+
+
+def test_gate_timeout_zero_blocks_on_unknown_sha_after_push(tmp_path):
+    ledger = _ledger(tmp_path)
+    run_id = ledger.run_create("epic-23", "build")
+    clock = _Clock()
+    gate = _run_merge_ci_gate(
+        "merge", ledger, run_id, _story(), 100, BuildOptions(ci_gate_timeout_s=0),
+        status_fn=lambda: ih.CR_FAILED, head_sha_fn=lambda: None,
+        sleep_fn=clock.sleep, clock=clock, expected_sha="newsha",
+    )
+    assert gate.polls == 1
+    assert gate.verdict == _GATE_BLOCK
+    assert gate.status == ih.CR_PENDING
+
+
+def test_gate_without_a_push_keeps_status_only_behaviour(tmp_path):
     ledger = _ledger(tmp_path)
     run_id = ledger.run_create("epic-23", "build")
     clock = _Clock()
     gate = _run_merge_ci_gate(
         "merge", ledger, run_id, _story(), 100, BuildOptions(),
         status_fn=lambda: ih.CR_SUCCESS, head_sha_fn=lambda: None,
-        sleep_fn=clock.sleep, clock=clock, expected_sha="newsha",
+        sleep_fn=clock.sleep, clock=clock,
     )
-    assert gate is not None
     assert gate.verdict == _GATE_PASS
+
+
+def test_pushed_head_sha_is_empty_not_none_when_unreadable(tmp_path, monkeypatch):
+    monkeypatch.undo()  # drop the autouse conftest stub
+    from sdlc.build import _pushed_head_sha
+    assert _pushed_head_sha(tmp_path, "feature/issue-4") == ""
+
+

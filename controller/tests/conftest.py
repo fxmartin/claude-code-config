@@ -317,3 +317,18 @@ def _green_ci_by_default(monkeypatch):
         return cr_mod.CR_SUCCESS if status is None else status
 
     monkeypatch.setattr(build_mod, "_ci_status_lookup", _lookup)
+
+
+@pytest.fixture(autouse=True)
+def _no_pushed_head_guard(monkeypatch):
+    """Default tests to "no readable pushed head" (the pre-#947 behaviour).
+
+    Fail-closed (#947) makes the merge gate wait out its real timeout when a
+    bugfix push leaves the head unreadable — as in every non-git ``tmp_path``
+    run. Tests of the guard itself stub ``_pushed_head_sha``/the pipeline sha.
+    """
+    import sdlc.build as build_mod
+    import sdlc.fix_issue as fix_mod
+
+    monkeypatch.setattr(build_mod, "_pushed_head_sha", lambda root, branch: None)
+    monkeypatch.setattr(fix_mod, "_pushed_head_sha", lambda root, branch: None)
