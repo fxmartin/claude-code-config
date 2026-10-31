@@ -238,7 +238,7 @@ Opens with the story-driven-development paragraph, then:
 
 ### Section 4b: Piloting the SDLC
 
-Five rules for driving the `sdlc` controller, each pointing at a guard rail the controller already has: look before acting, front door only, never nest, one live run per repo, and long runs are not tool calls. The one gap is stated in the rule itself: `sdlc fix` and `sdlc resume` refuse a second live owner, a fresh `sdlc build` does not.
+Five rules for driving the `sdlc` controller: look before acting, front door only, never nest, one live run per repo, and long runs are not tool calls. Most are conventions the controller does not enforce, and each rule states what is: `sdlc fix` and `sdlc resume` refuse a second live owner, a fresh `sdlc build` does not, and `SDLC_BATCH_BUILD` is only a marker, so nothing refuses a nested run.
 
 **What it solves:** an agent otherwise learns the controller exists only when a skill fires. A session that wants to check or start a run has no orientation, and a dispatched agent has no reason to know it must not start one.
 

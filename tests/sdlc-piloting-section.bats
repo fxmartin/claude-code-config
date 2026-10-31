@@ -11,6 +11,7 @@ setup() {
     DISPATCH_PY="${REPO_ROOT}/controller/src/sdlc/dispatch.py"
     BUILD_PY="${REPO_ROOT}/controller/src/sdlc/build.py"
     CLI_PY="${REPO_ROOT}/controller/src/sdlc/cli.py"
+    CONTROLLER_SRC="${REPO_ROOT}/controller/src"
 }
 
 # Extract from the heading to the next top-level heading, exclusive.
@@ -40,7 +41,7 @@ piloting_block() {
     done
 }
 
-@test "the section names each guard rail it points at" {
+@test "the section names each command and marker it relies on" {
     block="$(piloting_block "$CLAUDE_MD")"
     for marker in 'sdlc status' 'sdlc runs' 'sdlc queue list' 'sdlc doctor' \
         '--enqueue' 'run-*' 'SDLC_BATCH_BUILD' '<<<RESULT_JSON>>>' 'resume --force'; do
@@ -67,8 +68,9 @@ piloting_block() {
     rule="$(piloting_block "$CLAUDE_MD" | grep 'One live run per repo')"
     [[ "$rule" == *'`sdlc runs` shows `DEAD`'* ]]
     [[ "$rule" != *'`sdlc status` shows'* ]]
+    # -eq 1, not -ne 0: grep exits 2 on a moved file and would pass unchecked.
     run grep -n 'sdlc status.*DEAD' "$CLI_PY"
-    [ "$status" -ne 0 ]
+    [ "$status" -eq 1 ]
 }
 
 @test "a dead run needs no --force" {
@@ -83,7 +85,36 @@ piloting_block() {
     [[ "$rule" == *'a fresh `sdlc build` is not guarded'* ]]
     # When build grows the refusal this fails: drop the caveat from the rule.
     run grep -n 'format_live_owner_refusal' "$BUILD_PY"
-    [ "$status" -ne 0 ]
+    [ "$status" -eq 1 ]
+}
+
+@test "the section does not promise enforcement the controller lacks" {
+    # Most rules are conventions; calling them guard rails has an agent rely on
+    # a refusal that never comes. Applies to the guide's summary too.
+    block="$(piloting_block "$CLAUDE_MD")"
+    [[ "$block" != *'guard rail'* ]]
+    [[ "$block" == *'conventions the controller does not enforce'* ]]
+    section="$(awk '/^### Section 4b:/{f=1;next} f&&/^### /{exit} f' "$GUIDE_MD")"
+    [ -n "$section" ]
+    [[ "$section" != *'guard rail'* ]]
+}
+
+@test "the nesting rule admits SDLC_BATCH_BUILD is only a marker" {
+    rule="$(piloting_block "$CLAUDE_MD" | grep 'Never nest')"
+    [[ "$rule" == *'the controller will not refuse a nested run'* ]]
+    # When the controller reads the variable this fails: drop the caveat. Only
+    # dispatch's assignment and its docstring may mention it.
+    [ -d "$CONTROLLER_SRC" ]
+    readers="$(grep -rn --include='*.py' 'SDLC_BATCH_BUILD' "$CONTROLLER_SRC" |
+        grep -v -e 'env\["SDLC_BATCH_BUILD"\] = "1"' -e '``SDLC_BATCH_BUILD=1``' || true)"
+    [ -z "$readers" ]
+}
+
+@test "the look-first commands are not overclaimed as read-only" {
+    # sdlc status runs ledger.ensure_migrated() first, so it can write schema.
+    rule="$(piloting_block "$CLAUDE_MD" | grep 'Look before acting')"
+    [[ "$rule" != *'read-only'* ]]
+    [[ "$rule" == *'change no run state'* ]]
 }
 
 @test "both parity suites run in the CI bats list" {
