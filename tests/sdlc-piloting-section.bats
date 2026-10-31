@@ -9,6 +9,8 @@ setup() {
     CI_YML="${REPO_ROOT}/.github/workflows/ci.yml"
     GUIDE_MD="${REPO_ROOT}/docs/claude-md-guide.md"
     DISPATCH_PY="${REPO_ROOT}/controller/src/sdlc/dispatch.py"
+    BUILD_PY="${REPO_ROOT}/controller/src/sdlc/build.py"
+    CLI_PY="${REPO_ROOT}/controller/src/sdlc/cli.py"
 }
 
 # Extract from the heading to the next top-level heading, exclusive.
@@ -57,6 +59,31 @@ piloting_block() {
     # A renamed env var would leave "Never nest" silently unenforceable.
     run grep -n 'env\["SDLC_BATCH_BUILD"\]' "$DISPATCH_PY"
     [ "$status" -eq 0 ]
+}
+
+@test "DEAD is read from sdlc runs, the view that derives it" {
+    # status_snapshot never calls derive_state: a crashed run stays IN_PROGRESS
+    # there, so an agent waiting on sdlc status for DEAD waits forever.
+    rule="$(piloting_block "$CLAUDE_MD" | grep 'One live run per repo')"
+    [[ "$rule" == *'`sdlc runs` shows `DEAD`'* ]]
+    [[ "$rule" != *'`sdlc status` shows'* ]]
+    run grep -n 'sdlc status.*DEAD' "$CLI_PY"
+    [ "$status" -ne 0 ]
+}
+
+@test "a dead run needs no --force" {
+    # find_live_owner already skips a gone pid, so --force is for a refusal.
+    rule="$(piloting_block "$CLAUDE_MD" | grep 'One live run per repo')"
+    [[ "$rule" == *'plain `sdlc resume`'* ]]
+    [[ "$rule" == *'only after a refusal'* ]]
+}
+
+@test "the section admits a fresh sdlc build has no live-owner guard" {
+    rule="$(piloting_block "$CLAUDE_MD" | grep 'One live run per repo')"
+    [[ "$rule" == *'a fresh `sdlc build` is not guarded'* ]]
+    # When build grows the refusal this fails: drop the caveat from the rule.
+    run grep -n 'format_live_owner_refusal' "$BUILD_PY"
+    [ "$status" -ne 0 ]
 }
 
 @test "both parity suites run in the CI bats list" {
