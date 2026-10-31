@@ -5954,18 +5954,16 @@ def _run_merge_ci_gate(
                 # appear. Fail closed: an unreadable pushed head or pipeline sha
                 # is never trusted as a match (bounded by the gate timeout).
                 if not stale_sha:
-                    unknown = (
-                        "pushed head" if not expected_sha else "pipeline sha"
-                    ) if (not expected_sha or seen is None) else None
+                    if not expected_sha:
+                        why = "pushed head unreadable after a bugfix push"
+                    elif seen is None:
+                        why = "pipeline sha unreadable after a bugfix push"
+                    else:
+                        why = f"pipeline is on {seen[:12]}, not the pushed head"
                     ledger.event_log(
                         run_id, story.id, "warn", "controller",
-                        "merge CI gate: "
-                        + (
-                            f"{unknown} unreadable after a bugfix push"
-                            if unknown
-                            else f"pipeline is on {seen[:12]}, not the pushed head"
-                        )
-                        + f" — treating status as pending (cr=#{pr_number})",
+                        f"merge CI gate: {why} — treating status as pending "
+                        f"(cr=#{pr_number})",
                     )
                 stale_sha[:] = [seen or ""]
                 return CR_PENDING
