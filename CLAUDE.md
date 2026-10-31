@@ -113,6 +113,16 @@ Strong success criteria let agents loop independently. Weak criteria ("make it w
 
 **Integration patterns**: API-agnostic frontends · database optimization (no N+1) · Podman + OCI · security-first · performance monitoring.
 
+## Piloting the SDLC
+
+`sdlc` is the controller that owns the build and fix pipelines; the skills are thin wrappers around it. Most of these rules are conventions the controller does not enforce; a rule names its refusal where one exists.
+
+- **Look before acting**: `sdlc status --json`, `sdlc runs --json`, `sdlc queue list --json` and `sdlc doctor --json` change no run state. Read them before starting anything.
+- **Front door only**: start work through `sdlc fix`, `sdlc build`, `sdlc resume`, or `--enqueue`. Never call the `run-*` internals.
+- **Never nest**: `SDLC_BATCH_BUILD` set means you are a dispatched agent. Return your `<<<RESULT_JSON>>>` block; do not start a run. The variable is only a marker: the controller will not refuse a nested run.
+- **One live run per repo**: check `sdlc runs --json` first. `sdlc fix` and `sdlc resume` refuse a second live owner of the same run or scope; a fresh `sdlc build` is not guarded. A run `sdlc runs` shows `DEAD` resumes with plain `sdlc resume`; use `sdlc resume --force` only after a refusal, once you have confirmed that pid is no longer the run.
+- **Long runs are not tool calls**: `build` and `fix` run for hours. Poll with `sdlc status`; never block on them.
+
 ## CLI Tools — Prefer installed utilities over builtins
 The following tools are installed and SHOULD be used via Bash when the built-in Claude Code tools (Read, Grep, Glob, Edit) are insufficient or when working in shell scripts, pipelines, or subagents:
 

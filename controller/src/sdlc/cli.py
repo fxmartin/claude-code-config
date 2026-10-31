@@ -1093,7 +1093,8 @@ def resume(
     Issue #595: refused (exit 1, run untouched) when the host registry shows this
     run already live under another pid — two processes must never drive the same
     run at once. Pass ``--force`` to take over, but only once you have confirmed
-    that pid is actually gone (``sdlc status`` shows a stale run as ``DEAD``).
+    that pid is actually gone. ``sdlc runs`` shows a stale run as ``DEAD``, and a
+    run whose pid is gone is not refused, so plain resume takes it.
     """
     from sdlc.build import _parse_budget_value
     from sdlc.discovery import canonical_scope
