@@ -1,6 +1,6 @@
 # Epic 35: Fleet Execution — One Queue, Many Workers
 
-> **Status: COMPLETE (39/39)** — 35.2-015 merged 2026-10-30 (job 51, #942, v2.127.0); 35.2-015 (a repo that builds only on Linux never lands on a Mac worker) added 2026-10-30 from fleet job 49; 35.1-005 and 35.5-011 merged 2026-10-29 (job 47, #931/#932); 35.1-005 (a broken `tailscale whois` reads as unavailable, issue #833) and 35.5-011 (`sdlc fix` runs in its own worktree, issue #799) added 2026-10-29; 35.2-010 and 35.5-010 merged 2026-10-28..29 (jobs 46 and 45, #926/#925, v2.122.0+); 35.5-010 (reconcile on a worker leaves its clone clean) added 2026-10-28 from job 44's `DIRTY_WORKING_TREE` hold; 35.5-007, 35.5-008 and 35.5-009 merged 2026-10-28 (job 44, #920/#919/#921, v2.119.0–v2.121.0); 35.5-007 (a bugfix that only re-ran CI re-checks the merge gate), 35.5-008 (reconcile from an SSH shell reaches the fleet queue) and 35.5-009 (controller tests pass inside an agent worktree) added 2026-10-28 from fleet job 43; 35.2-013 and 35.2-014 merged 2026-10-28 (job 43, #910/#911, v2.117.0/v2.118.0); 35.2-013 (a failed worker self-check names the real error) and 35.2-014 (doctor warns when a Mac worker's Keychain can lock) added 2026-10-28 from the home-lab worker going offline after the v2.116.0 deploy; 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
+> **Status: IN PROGRESS (39/42)** — 35.2-016, 35.2-017 and 35.2-018 added 2026-11-01 from bootstrapping dev-server (sandbox image vs AppArmor userns, stale skill copies, units enabled while sdlc crashed or the queue said 403); 35.2-015 merged 2026-10-30 (job 51, #942, v2.127.0); 35.2-015 (a repo that builds only on Linux never lands on a Mac worker) added 2026-10-30 from fleet job 49; 35.1-005 and 35.5-011 merged 2026-10-29 (job 47, #931/#932); 35.1-005 (a broken `tailscale whois` reads as unavailable, issue #833) and 35.5-011 (`sdlc fix` runs in its own worktree, issue #799) added 2026-10-29; 35.2-010 and 35.5-010 merged 2026-10-28..29 (jobs 46 and 45, #926/#925, v2.122.0+); 35.5-010 (reconcile on a worker leaves its clone clean) added 2026-10-28 from job 44's `DIRTY_WORKING_TREE` hold; 35.5-007, 35.5-008 and 35.5-009 merged 2026-10-28 (job 44, #920/#919/#921, v2.119.0–v2.121.0); 35.5-007 (a bugfix that only re-ran CI re-checks the merge gate), 35.5-008 (reconcile from an SSH shell reaches the fleet queue) and 35.5-009 (controller tests pass inside an agent worktree) added 2026-10-28 from fleet job 43; 35.2-013 and 35.2-014 merged 2026-10-28 (job 43, #910/#911, v2.117.0/v2.118.0); 35.2-013 (a failed worker self-check names the real error) and 35.2-014 (doctor warns when a Mac worker's Keychain can lock) added 2026-10-28 from the home-lab worker going offline after the v2.116.0 deploy; 35.5-006 (reconcile updates the run's fleet record) added 2026-10-19 from the stale job 12 record; 35.2-012 (doctor checks the marketplace the way the installer sets it up) added 2026-10-19 from the M3 Max bootstrap; 35.2-011 merged 2026-10-19 (fleet job 12, #891 v2.111.0); 35.5-005 (an approved parked job resumes on the worker that holds its run) added 2026-10-19 from job 12; 35.2-011 (Mac worker finds its glab login; bootstrap reports truthfully) added 2026-10-18 from the first M3 Max bootstrap; 35.1-004 merged 2026-10-16 (fleet job 10, #884 v2.107.0); 35.2-009 merged 2026-10-16 (fleet job 9, #877 v2.106.0); 35.2-010 (Linux worker advertises its dashboard) added 2026-10-16 from job 9 review 4; 35.1-004 (queue service listen backlog resets connections on macOS) added 2026-10-16 from job 9; 35.2-007, 35.4-006, 35.5-001 and 35.2-008 merged 2026-10-05..08; 35.2-006 and 35.4-005 merged 2026-10-10..11 (fleet job 3, #858 v2.100.0, #857 v2.101.0); 35.5-004 and 35.5-002 merged 2026-10-11 (job 7, #867 v2.102.0, #868 v2.103.0); 35.5-003 and 35.3-002 building (job 8, M3 Max, 2026-10-16); 35.3-002 (fleet PRs close their issues) added 2026-10-08; 35.5-002, 35.5-003 and 35.5-004 added 2026-10-10 from job 3; 35.2-009 (macOS worker bootstrap and agent drift) added 2026-10-16. authored 2026-10-02; 35.2-005 added 2026-10-03; 35.2-006, 35.2-007, 35.4-005 and 35.4-006 added 2026-10-04 from the first fleet jobs; 35.2-008 (Hetzner Linux worker) added 2026-10-04 after the M3 Max was gated by Little Snitch; 35.5-001 (push committed recovery work before failing) added 2026-10-04 from job 4. Thesis: a build pins
 > the XPS for 30–90 minutes, dies when the lid closes, and runs while two Macs
 > sit idle a few metres away on the same tailnet. Epic 32 built the durable
 > development queue but deliberately stopped at one host ("multi-host execution
@@ -64,7 +64,7 @@ Hetzner box later with zero redesign.
   `sdlc queue` invocation behaves byte-for-byte as today.
 
 ## Epic Scope
-**Total Stories**: 39 | **Total Points**: 125 | **MVP Stories**: 12 (49 pts)
+**Total Stories**: 42 | **Total Points**: 133 | **MVP Stories**: 12 (49 pts)
 
 ## Features in This Epic
 
@@ -1029,6 +1029,143 @@ locally on the XPS instead.
 - [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
 
 **Dependencies**: 35.2-003, 35.3-001
+**Risk Level**: Low
+
+##### Story 35.2-016: A worker that cannot build the sandbox image still bootstraps, and doctor says why
+**User Story**: As FX, I want `fleet-bootstrap.sh` to set up a worker whose
+podman cannot build the sandbox image, and doctor to name the reason, so that
+a Linux worker joins the fleet without a hand-written `deploy.sh` wrapper.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** `fleet-bootstrap.sh --skip-sandbox-image` **When** it runs
+  **Then** it calls `deploy.sh --skip-sandbox-image`, and the worker
+  registers without a sandbox, so `SDLC_SANDBOX=1` jobs don't match it.
+- **Given** a Linux host with
+  `kernel.apparmor_restrict_unprivileged_userns = 1` and podman outside every
+  AppArmor profile (a `/nix/store` path) **When** `sdlc doctor` runs **Then**
+  a `sandbox-userns` check reports WARN naming the sysctl, the podman path,
+  and both remedies: an AppArmor profile for that path, or
+  `--skip-sandbox-image`.
+- **Given** the same host **When** `deploy.sh` fails to build the image
+  **Then** its error names the AppArmor restriction and the
+  `--skip-sandbox-image` flag (on `fleet-bootstrap.sh` as well as
+  `deploy.sh`), not only `sandbox image build failed`.
+- **Given** a Mac, or a Linux host where userns is not restricted **When**
+  doctor runs **Then** the check is CLEAN or n/a, never FAIL.
+
+**Technical Notes**: Bootstrapping `dev-server` (Ubuntu 24.04, 2026-11-01)
+stopped at `podman build`: `failed to reexec: Permission denied`.
+Ubuntu restricts unprivileged user namespaces to binaries with an AppArmor
+profile. `/etc/apparmor.d/podman` covers `/usr/bin/podman`, but the dev
+shell's podman lives in `/nix/store`, so `podman info` works and
+`podman build` fails. `deploy.sh` dies before installing the controller, so
+the whole bootstrap stops. The workaround was
+`DEPLOY_SH=~/.cache/deploy-nosandbox.sh`, a wrapper that adds
+`--skip-sandbox-image`.
+- `fleet-bootstrap.sh` calls `run "${DEPLOY_SH}"` with no arguments (step 3);
+  pass the flag through.
+- Read the sysctl from `/proc/sys/kernel/apparmor_restrict_unprivileged_userns`;
+  inject the reader so tests never touch `/proc`.
+- The AppArmor profile itself belongs in bootstrap-dev-server, not here.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: flag passed through to deploy.sh; restricted + nix podman →
+      WARN with both remedies; unrestricted or Mac → CLEAN/n/a; deploy
+      failure message names the cause
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-008
+**Risk Level**: Low
+
+##### Story 35.2-017: A real skill directory that blocks a link is reported and can be replaced
+**User Story**: As FX, I want `install.sh --core` to tell me when an old
+copy of a skill blocks its link and offer a safe way to replace it, so that a
+worker never runs stale skills while the installer reports success.
+**Priority**: Should Have
+**Story Points**: 2
+
+**Acceptance Criteria**:
+- **Given** `~/.claude/skills/<name>` is a real directory for a skill this
+  repo ships **When** `install.sh --core` runs **Then** it still leaves the
+  directory alone, and the summary ends with a WARN that lists the blocked
+  skills and the command that replaces them.
+- **Given** `install.sh --core --replace-stale-skills` **When** it runs
+  **Then** each blocking directory is moved to
+  `~/.claude/skills/.replaced-<timestamp>/<name>` (never deleted) and the
+  link is created.
+- **Given** a skill directory this repo does not ship (a foreign skill)
+  **When** either form runs **Then** it is untouched.
+- **Given** a blocking directory **When** `sdlc doctor` runs **Then**
+  `install-integrity` reports WARN naming the skills and the flag.
+
+**Technical Notes**: On `dev-server` (2026-11-01) every `install.sh --core`
+run printed `⚠ Skipping skill <name>: a real … already exists (left
+untouched)` for all ten shipped skills, then `✓ Installation complete!`.
+The box predates per-skill links, so its agents run old copies that never
+update. `link_skill_entries` in `install/core.sh` skips with a `warn`;
+`_skill_entry_is_foreign` already tells shipped from foreign skills. Doctor's
+install-integrity check counts only the managed paths, so it reports CLEAN.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: blocked skills listed in the summary; `--replace-stale-skills`
+      moves then links; foreign skill untouched; doctor WARN
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: None
+**Risk Level**: Low
+
+##### Story 35.2-018: The bootstrap does not enable a worker that cannot start or reach the queue
+**User Story**: As FX, I want `fleet-bootstrap.sh` to stop before
+enabling the worker unit when `sdlc` crashes or the queue rejects the host,
+so that a broken bootstrap never leaves a worker in a restart loop.
+**Priority**: Should Have
+**Story Points**: 3
+
+**Acceptance Criteria**:
+- **Given** `sdlc doctor` exits with a Python traceback (import failure,
+  any exit other than its own 0/1/2) **When** the bootstrap reaches step 6
+  **Then** it stops before installing units, prints the traceback's last
+  line, and exits non-zero.
+- **Given** doctor reports `Fleet queue` FAIL with 403 **And** the worker
+  has no token (none in the environment or `~/.config/sdlc/worker.env`)
+  **When** the bootstrap reaches step 7 **Then** it doesn't enable the
+  worker unit. It names `~/.config/sdlc/worker.env` and how to fill it from
+  the queue host, and exits non-zero.
+- **Given** a re-run after the token is written **When** doctor passes the
+  queue checks **Then** the unit is installed and started as today.
+- **Given** other doctor FAILs (the unit not running yet, no self-check)
+  **When** the bootstrap runs **Then** it carries on as today: those only
+  clear once the unit runs.
+
+**Technical Notes**: On `dev-server` (2026-11-01) the bootstrap
+installed and enabled `sdlc-worker.service` twice while it could not run.
+- **First run:** `sdlc` crashed on import (`No module named 'rpds.rpds'`,
+  from a dev-shell `PYTHONPATH` leak, fixed in bootstrap-dev-server !34).
+- **Second run:** the queue answered 403 because the host had no
+  `SDLC_QUEUE_TOKEN`.
+- **Both times:** the script only printed
+  `warning: sdlc doctor was not CLEAN … re-run this script after fixing
+  it`, and the unit restart-looped (`status=2/INVALIDARGUMENT`) until FX
+  copied the token from home-lab's queue plist.
+
+Implementation pointers:
+- `DOCTOR_RC` is captured at step 6 and only warned on at the end.
+- Use `sdlc doctor --json` (or `--only fleet-queue`) to tell the queue 403
+  apart from FAILs that only a running unit clears.
+- `installed_token` already reads the token from the installed agent.
+
+**Definition of Done**:
+- [ ] Code implemented and peer reviewed
+- [ ] Tests: doctor crash → no unit, non-zero; 403 with no token → no unit,
+      remedy printed; token present → unit installed; unit-only FAILs →
+      unchanged
+- [ ] User-facing docs updated in the same commit for behavior-changing diffs (README/docs/usage/help; CHANGELOG excluded — Epic-05 owns it)
+
+**Dependencies**: 35.2-008
 **Risk Level**: Low
 
 ### Feature 35.3: Launch from the XPS
