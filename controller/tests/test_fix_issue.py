@@ -5342,3 +5342,69 @@ def test_fix_merge_bugfix_push_failure_parks_needs_attention(tmp_path, monkeypat
     monkeypatch.setattr(fix_mod, "_push_bugfix_commit", lambda *a, **k: False)
     result = _run_gated_fix(tmp_path, RecordingDispatcher())
     assert result.status == "NEEDS_ATTENTION"
+
+
+def test_fix_review_bugfix_is_pushed_and_packet_rebaked_before_rereview(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #949: a review-stage bugfix reaches origin and the review packet is
+    re-baked before the second review dispatch."""
+    import sdlc.fix_issue as fix_mod
+
+    order: list[str] = []
+    monkeypatch.setattr(
+        fix_mod, "_push_bugfix_commit", lambda *a, **k: order.append("push") or True
+    )
+    monkeypatch.setattr(
+        fix_mod, "_bake_review_packet", lambda *a, **k: order.append("bake") or None
+    )
+
+    from sdlc.contracts import SchemaValidationError
+
+    def review_script(n):
+        order.append(f"review{n}")
+        if n == 0:
+            raise SchemaValidationError("review response missing final_status")
+        return _default_payload("review")
+
+    dispatch = RecordingDispatcher(overrides={"review": review_script})
+    result = _run_gated_fix(tmp_path, dispatch)
+    assert result.status == "DONE"
+    assert order.index("push") < order.index("review1")
+    assert order.count("bake") == 2 and order.index("bake", order.index("push")) < order.index("review1")
+
+
+def test_fix_review_bugfix_push_failure_parks_needs_attention(tmp_path, monkeypatch) -> None:
+    import sdlc.fix_issue as fix_mod
+    from sdlc.contracts import SchemaValidationError
+
+    monkeypatch.setattr(fix_mod, "_push_bugfix_commit", lambda *a, **k: False)
+
+    def review_script(n):
+        raise SchemaValidationError("review response missing final_status")
+
+    dispatch = RecordingDispatcher(overrides={"review": review_script})
+    result = _run_gated_fix(tmp_path, dispatch)
+    assert result.status == "NEEDS_ATTENTION"
+    assert dispatch.counts["review"] == 1
+    assert "merge" not in dispatch.agents()
+
+
+def test_fix_non_review_bugfix_is_pushed_too(tmp_path, monkeypatch) -> None:
+    import sdlc.fix_issue as fix_mod
+    from sdlc.contracts import SchemaValidationError
+
+    pushes: list[int] = []
+    monkeypatch.setattr(
+        fix_mod, "_push_bugfix_commit", lambda *a, **k: pushes.append(1) or True
+    )
+
+    def coverage_script(n):
+        if n == 0:
+            raise SchemaValidationError("coverage response invalid")
+        return _default_payload("coverage")
+
+    dispatch = RecordingDispatcher(overrides={"coverage": coverage_script})
+    result = _run_gated_fix(tmp_path, dispatch)
+    assert result.status == "DONE"
+    assert pushes

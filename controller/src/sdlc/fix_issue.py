@@ -2014,18 +2014,26 @@ def _run_stage_loop(
                 return "NEEDS_ATTENTION", pr_number
             if not fixed:
                 return "FAILED", pr_number
+            # Issues #938/#949: publish the bugfix commit before the stage is
+            # re-read — the merge gate and the re-review both read the PR's
+            # remote head, so an unpushed fix burns the budget on a phantom.
+            if not _push_bugfix_commit(story, root, ledger, run_id):
+                ledger.event_log(
+                    run_id, story.id, "warn", "controller",
+                    f"{stage} bugfix could not reach origin/feature/{story.id} — "
+                    "parking NEEDS_ATTENTION; commits preserved on the branch",
+                )
+                return "NEEDS_ATTENTION", pr_number
             if stage == "merge":
-                # Issue #938: publish the bugfix commit before the re-gate, else
-                # the gate reads the old head's pipeline and burns the budget.
-                if not _push_bugfix_commit(story, root, ledger, run_id):
-                    ledger.event_log(
-                        run_id, story.id, "warn", "controller",
-                        f"merge bugfix could not reach origin/feature/{story.id} — "
-                        "parking NEEDS_ATTENTION; commits preserved on the branch",
-                    )
-                    return "NEEDS_ATTENTION", pr_number
                 pushed_bugfix_head = _pushed_head_sha(
                     root or Path.cwd(), f"feature/{story.id}"
+                )
+            elif stage == "review" and pr_number is not None:
+                # The packet is built from the remote diff; re-bake it so the
+                # re-review sees the fix just pushed, not the stale head.
+                review_packet_block = _bake_review_packet(
+                    issue, story, pr_number, ledger, run_id,
+                    host=host, instance_url=instance_url,
                 )
             attempt += 1
 
