@@ -23,10 +23,19 @@ _skill_entry_is_foreign() {
   return 1
 }
 
+# Shipped skills whose link a real ~/.claude/skills/<name> blocked this run,
+# space-separated; report_blocked_skills prints them last (35.2-017).
+BLOCKED_SKILLS=""
+
 # Link each repo skill individually so ~/.claude/skills stays a real directory
 # that distro-, runtime- and user-provided skills can live in (#694).
+# A real directory in a shipped skill's place is a stale pre-#694 copy: left
+# alone and reported, or with REPLACE_STALE_SKILLS=true moved (never deleted)
+# into skills/.replaced-<timestamp>/ and linked (35.2-017).
 link_skill_entries() {
   local skills_dst="$CLAUDE_DIR/skills" entry name
+  local replaced_dir replaced_made=false
+  replaced_dir="$skills_dst/.replaced-$(date +%Y%m%d-%H%M%S)"
 
   # Migrate a legacy directory-level symlink into the clone.
   if [ -L "$skills_dst" ] && [ "$(readlink "$skills_dst")" = "$SCRIPT_DIR/skills" ]; then
@@ -39,11 +48,30 @@ link_skill_entries() {
     name="$(basename "$entry")"
     _skill_entry_is_foreign "$name" && continue
     if [ -e "$skills_dst/$name" ] && [ ! -L "$skills_dst/$name" ]; then
+      if [ "${REPLACE_STALE_SKILLS:-false}" = "true" ]; then
+        $replaced_made || ensure_dir "$replaced_dir"
+        replaced_made=true
+        run mv "$skills_dst/$name" "$replaced_dir/$name"
+        warn "Moved stale skill $name to $replaced_dir/"
+        # Not create_symlink: in dry-run the directory is still there, and its
+        # backup_if_exists would preview a second, phantom move.
+        run ln -sfn "$entry" "$skills_dst/$name"
+        info "Linked $name → $entry"
+        continue
+      fi
       warn "Skipping skill $name: a real ${skills_dst}/$name already exists (left untouched)"
+      BLOCKED_SKILLS="${BLOCKED_SKILLS:+$BLOCKED_SKILLS }$name"
       continue
     fi
     create_symlink "$entry" "$skills_dst/$name"
   done
+}
+
+# Final summary line naming every shipped skill a stale real directory still
+# shadows, so "Installation complete!" never hides them (35.2-017).
+report_blocked_skills() {
+  [ -n "$BLOCKED_SKILLS" ] || return 0
+  warn "Stale skill copies block their links (agents run the old copies): ${BLOCKED_SKILLS// /, } — replace them with: ./install.sh --core --replace-stale-skills"
 }
 
 # Remove only the per-skill links --core created; foreign skills stay.

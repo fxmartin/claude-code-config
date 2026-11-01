@@ -44,7 +44,12 @@
 # Doctor runs before the unit is installed: a worker that has not registered yet is
 # a FAIL by design, so judging steps 1-5 after step 7 would fail every first run.
 # Its status is the script's exit status (0 CLEAN, 1 WARN, 2 FAIL), reported after
-# the unit is in place so a re-run can repair a worker that is down. It skips
+# the unit is in place so a re-run can repair a worker that is down. Two verdicts stop
+# the run before step 7 instead, as the worker could only restart-loop (35.2-018): a
+# doctor that crashes (a traceback, or an exit other than 0/1/2) — the worker runs the
+# same `sdlc` — and, on Linux, a queue that refuses the box (403) while neither the
+# shell nor ~/.config/sdlc/worker.env holds an SDLC_QUEUE_TOKEN; the error says where
+# to copy the token from. It skips
 # fleet-agent-drift and worker-dashboard, which judge the very units and agents step 7
 # re-renders — counted, they would fail every run that repairs them; a worker step 7
 # leaves pending restart exits 1 instead. A Mac skips worker-keychain too, which has no
@@ -425,8 +430,13 @@ installed_token() { installed_env "$1" "${TOKEN_KEY}"; }  # LABEL — the instal
 #    run that repairs them. Step 7 answers for them — a worker it leaves pending
 #    restart exits 1. Linux judges its units the same way (35.2-010). On a Mac
 #    worker-keychain is n/a until step 7 installs the worker agent, so the
-#    summary judges it instead (Story 35.2-014). --skip-sandbox-image answers
-#    sandbox-userns: it WARNs on every box the flag is for (Story 35.2-016).
+#    summary judges it instead (Story 35.2-014). A doctor that crashes is fatal
+#    here, though: the worker runs the same `sdlc` (Story 35.2-018). --skip-sandbox-image
+#    answers sandbox-userns: it WARNs on every box the flag is for (Story 35.2-016).
+#    Rendered copies and doctor's stderr live in a scratch directory, so a dry run
+#    can diff the units and a real one can compare them byte for byte.
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "${WORK_DIR}"' EXIT
 DOCTOR_RC=0
 DOCTOR_ARGS=(--exit-code)
 if [[ "${DO_SERVICE}" == true ]]; then
@@ -448,14 +458,20 @@ else
     cd "${REPO_ROOT}"
     [[ -n "${SDLC_QUEUE_TOKEN:-}" || -z "${agent_token}" ]] || export SDLC_QUEUE_TOKEN="${agent_token}"
     sdlc doctor "${DOCTOR_ARGS[@]}"
-  ) || DOCTOR_RC=$?
+  ) 2>"${WORK_DIR}/doctor.err" || DOCTOR_RC=$?
+  cat "${WORK_DIR}/doctor.err" >&2
+  # Doctor's own verdicts are 0, 1 and 2. An `sdlc` that cannot even import exits 1
+  # with a traceback, so the traceback marks a crash, not the code alone. The unit
+  # would run that same `sdlc` and restart-loop (dev-server, 2026-11-01).
+  if [[ "${DOCTOR_RC}" -gt 2 ]] || grep -q 'Traceback (most recent call last)' "${WORK_DIR}/doctor.err"; then
+    crash="$(grep -v '^[[:space:]]*$' "${WORK_DIR}/doctor.err" | tail -n1 || true)"
+    die "sdlc doctor crashed (exit ${DOCTOR_RC}): ${crash:-no error output}
+       The worker runs this same sdlc, so no unit or agent was installed. Fix the controller
+       (a PYTHONPATH leaking from the shell? scripts/deploy.sh reinstalls it) and re-run."
+  fi
 fi
 
-# 7. The resident worker and its dashboard. Rendered copies live in a scratch
-#    directory, so a dry run can diff them and a real one can compare them byte
-#    for byte with what is installed.
-WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "${WORK_DIR}"' EXIT
+# 7. The resident worker and its dashboard.
 
 # Linux: install one unit file, enable it, and restart it only if it changed under
 # a running process. Asked before `enable --now`: a unit that call starts already
@@ -537,6 +553,14 @@ redact_token() {  # FILE — FILE with its token masked
 # KEY's value in the Linux worker's EnvironmentFile (worker.env), quotes stripped, or nothing.
 unit_env() {
   { sed -n "s/^$1=//p" "${ENV_FILE}" 2>/dev/null || true; } | tail -n1 | sed -e "s/^[\"']//" -e "s/[\"']\$//"
+}
+
+# Whether doctor's fleet-queue check FAILs on a 403 — the queue reachable, this box refused.
+queue_refuses_box() {
+  local report
+  report="$(cd "${REPO_ROOT}" && sdlc doctor --json --only fleet-queue 2>/dev/null)" || return 1
+  jq -e 'any(.findings[]; .check == "fleet-queue" and .status == "FAIL" and (.detail | contains("(403)")))' \
+    <<<"${report}" >/dev/null 2>&1
 }
 
 # The job ids running on this worker, comma-separated; nonzero if the queue cannot be read.
@@ -669,6 +693,20 @@ elif [[ "${DO_SERVICE}" == true ]]; then
   else
     [[ -e "${ENV_FILE}" ]] || install -m 600 /dev/null "${ENV_FILE}"
     chmod 600 "${ENV_FILE}"
+  fi
+
+  # A queue that refuses this box (403) refuses its worker too, which then exits on
+  # every start (dev-server, 2026-11-01). With no token anywhere the remedy is the
+  # file above. Asked only after a FAIL: the other FAILs clear once the unit runs.
+  if [[ "${DRY_RUN}" == false && "${DOCTOR_RC}" -eq 2 && -z "${SDLC_QUEUE_TOKEN:-}" \
+      && -z "$(unit_env "${TOKEN_KEY}")" ]] && queue_refuses_box; then
+    die "the fleet queue refuses this box (403) and it has no ${TOKEN_KEY}, so the worker would
+       restart-loop: no unit was installed or enabled. Copy the service's shared secret from the
+       queue host (on home-lab: plutil -extract EnvironmentVariables.${TOKEN_KEY} raw
+       ~/Library/LaunchAgents/${QUEUE_LABEL}.plist) into ~/.config/sdlc/worker.env (mode 600,
+       already created) as the line
+         ${TOKEN_KEY}=<the token>
+       and re-run — or allow this box's tailnet login on the queue (SDLC_QUEUE_ALLOW)."
   fi
 
   # Both units take the one tailnet address (validated above); %h is systemd's to expand.
