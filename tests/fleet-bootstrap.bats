@@ -74,6 +74,16 @@ if [ "$1 $2" = "queue list" ]; then
 fi
 echo "sdlc-cwd ${PWD}" >>"${CALLS}"
 echo "doctor-token ${SDLC_QUEUE_TOKEN:-}" >>"${CALLS}"
+# `doctor --json` answers from $TMP/doctor.json (no findings unless a test writes it), exit 0.
+case " $* " in *" --json "*)
+  if [ -f "$TMP/doctor.json" ]; then cat "$TMP/doctor.json"; else echo "{\"status\": \"CLEAN\", \"findings\": []}"; fi
+  exit 0 ;;
+esac
+# STUB_DOCTOR_CRASH: an sdlc that cannot import, as on dev-server — a traceback, exit 1.
+if [ -n "${STUB_DOCTOR_CRASH:-}" ]; then
+  printf "Traceback (most recent call last):\n  File \"sdlc\", line 5\nModuleNotFoundError: No module named rpds.rpds\n" >&2
+  exit 1
+fi
 exit "${STUB_DOCTOR_RC:-0}"'
     # One marker per unit: enable --now NAME starts NAME.
     stub systemctl '
@@ -274,6 +284,114 @@ exit 0'
 
     [ "$status" -eq 2 ]
     grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
+}
+
+# Story 35.2-018: on dev-server the unit was enabled twice while it could not run — once
+# with an `sdlc` that crashed on import, once with a queue that refused the box (403) —
+# and restart-looped. Neither is a FAIL only a running unit clears.
+DOCTOR_FINDING() {  # CHECK STATUS DETAIL — a one-finding `doctor --json` report
+    printf '{"status": "%s", "findings": [{"check": "%s", "name": "x", "status": "%s", "detail": "%s", "remedy": null}]}\n' \
+        "$2" "$1" "$2" "$3" >"${TMP}/doctor.json"
+}
+QUEUE_403() { DOCTOR_FINDING fleet-queue FAIL "${QUEUE} is reachable but identity not accepted (403)"; }
+
+@test "a doctor that crashes stops the run before any unit, naming the traceback's last line" {
+    export STUB_DOCTOR_CRASH=1
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"ModuleNotFoundError: No module named rpds.rpds"* ]]
+    [ ! -e "$(UNIT)" ]
+    ! grep -q "^systemctl --user enable" "${CALLS}" || false
+}
+
+@test "a doctor exit outside its own 0/1/2 stops the run before any unit" {
+    export STUB_DOCTOR_RC=139
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"exit 139"* ]]
+    [ ! -e "$(UNIT)" ]
+    ! grep -q "^systemctl --user enable" "${CALLS}" || false
+}
+
+@test "a Mac whose doctor crashes loads no agent" {
+    darwin
+    export STUB_DOCTOR_CRASH=1
+
+    run mac
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"ModuleNotFoundError"* ]]
+    [ ! -e "$(AGENT worker)" ] && [ ! -e "$(AGENT dashboard)" ]
+    ! grep -q "^launchctl bootstrap" "${CALLS}" || false
+}
+
+@test "a queue that refuses a box with no token enables no unit, and names worker.env and its fill" {
+    export STUB_DOCTOR_RC=2
+    QUEUE_403
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -ne 0 ]
+    [ ! -e "$(UNIT)" ]
+    ! grep -q "^systemctl --user enable" "${CALLS}" || false
+    [[ "$output" == *"~/.config/sdlc/worker.env"* ]]
+    [[ "$output" == *"SDLC_QUEUE_TOKEN="* ]]
+    [[ "$output" == *"com.fxmartin.sdlc-queue.plist"* ]]
+    # …and the file to fill is there, 0600, ready for the token.
+    f="${HOME}/.config/sdlc/worker.env"
+    [ -f "$f" ] && [ "$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f")" = "600" ]
+}
+
+@test "a re-run once worker.env holds the token installs and starts the unit" {
+    export STUB_DOCTOR_RC=2
+    QUEUE_403
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+    [ "$status" -ne 0 ]
+
+    echo 'SDLC_QUEUE_TOKEN=abc' >"${HOME}/.config/sdlc/worker.env"
+    export STUB_DOCTOR_RC=0
+    rm "${TMP}/doctor.json"
+    : >"${CALLS}"
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    cmp <(RENDERED_UNIT) "$(UNIT)"
+    grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
+}
+
+@test "a 403 with a token in worker.env or the shell is not the missing-token stop" {
+    export STUB_DOCTOR_RC=2
+    QUEUE_403
+    mkdir -p "${HOME}/.config/sdlc"
+    echo 'SDLC_QUEUE_TOKEN="abc"' >"${HOME}/.config/sdlc/worker.env"
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 2 ]
+    grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
+
+    rm "${HOME}/.config/sdlc/worker.env" "$(UNIT)"
+    : >"${CALLS}"
+    SDLC_QUEUE_TOKEN=shell-token run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 2 ]
+    grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
+}
+
+@test "FAILs only a running unit clears still install the unit, and are the exit status" {
+    export STUB_DOCTOR_RC=2
+    DOCTOR_FINDING worker-registered FAIL "worker dev is not registered"
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 2 ]
+    cmp <(RENDERED_UNIT) "$(UNIT)"
+    grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
+    [[ "$output" != *"worker.env"* ]]
 }
 
 @test "linger off is a warning with the fix, not a failure" {
