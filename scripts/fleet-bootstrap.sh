@@ -43,8 +43,9 @@
 #
 # Doctor runs before the unit is installed: a worker that has not registered yet is
 # a FAIL by design, so judging steps 1-5 after step 7 would fail every first run.
-# Its status is the script's exit status (0 CLEAN, 1 WARN, 2 FAIL), reported after
-# the unit is in place so a re-run can repair a worker that is down. Two verdicts stop
+# A FAIL is the script's exit status (2), reported after the unit is in place so a
+# re-run can repair a worker that is down; WARNs alone are named and the run exits 0,
+# so a chained `&& …` keeps going (35.2-020). Two verdicts stop
 # the run before step 7 instead, as the worker could only restart-loop (35.2-018): a
 # doctor that crashes (a traceback, or an exit other than 0/1/2) — the worker runs the
 # same `sdlc` — and, on Linux, a queue that refuses the box (403) while neither the
@@ -433,7 +434,7 @@ installed_token() { installed_env "$1" "${TOKEN_KEY}"; }  # LABEL — the instal
 #    summary judges it instead (Story 35.2-014). A doctor that crashes is fatal
 #    here, though: the worker runs the same `sdlc` (Story 35.2-018). --skip-sandbox-image
 #    answers sandbox-userns: it WARNs on every box the flag is for (Story 35.2-016).
-#    Rendered copies and doctor's stderr live in a scratch directory, so a dry run
+#    Rendered copies and doctor's output live in a scratch directory, so a dry run
 #    can diff the units and a real one can compare them byte for byte.
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "${WORK_DIR}"' EXIT
@@ -458,7 +459,8 @@ else
     cd "${REPO_ROOT}"
     [[ -n "${SDLC_QUEUE_TOKEN:-}" || -z "${agent_token}" ]] || export SDLC_QUEUE_TOKEN="${agent_token}"
     sdlc doctor "${DOCTOR_ARGS[@]}"
-  ) 2>"${WORK_DIR}/doctor.err" || DOCTOR_RC=$?
+  ) >"${WORK_DIR}/doctor.out" 2>"${WORK_DIR}/doctor.err" || DOCTOR_RC=$?
+  cat "${WORK_DIR}/doctor.out"
   cat "${WORK_DIR}/doctor.err" >&2
   # Doctor's own verdicts are 0, 1 and 2. An `sdlc` that cannot even import exits 1
   # with a traceback, so the traceback marks a crash, not the code alone. The unit
@@ -740,9 +742,15 @@ if [[ "${DRY_RUN}" == true ]]; then
   exit 0
 fi
 
-if [[ "${DOCTOR_RC}" -ne 0 ]]; then
+# A FAIL is the exit status; WARNs alone are reported and the run goes on, so a
+# chained `&& …` after it still runs (dev-server, 2026-11-01: one WARN stopped it).
+if [[ "${DOCTOR_RC}" -eq 2 ]]; then
   warn "sdlc doctor was not CLEAN (exit ${DOCTOR_RC}) before the unit/agents were installed — see above; re-run this script after fixing it"
   exit "${DOCTOR_RC}"
+fi
+if [[ "${DOCTOR_RC}" -eq 1 ]]; then
+  warned="$(sed -n 's/^\[WARN\] \(.*\) — .*/\1/p' "${WORK_DIR}/doctor.out" | paste -sd, - | sed 's/,/, /g')"
+  warn "sdlc doctor warned (exit 1) before the unit/agents were installed: ${warned:-see above} — the bootstrap carries on; fix them at leisure"
 fi
 if [[ "${PENDING_RESTART}" == true ]]; then
   if [[ "${IS_DARWIN}" == true ]]; then

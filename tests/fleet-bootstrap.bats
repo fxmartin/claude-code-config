@@ -286,6 +286,24 @@ exit 0'
     grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
 }
 
+# Story 35.2-020: on dev-server one WARN (`Run registry path`) exited 1, and FX's
+# chained `&& git switch -q main && …` never ran. Only a FAIL is a failed bootstrap.
+@test "a doctor with only WARNs exits 0, naming the WARN checks" {
+    stub sdlc '
+if [ "$1 $2" = "queue list" ]; then echo "{\"jobs\": []}"; exit 0; fi
+echo "[CLEAN] Fleet queue — reachable"
+echo "[WARN] Run registry path — XDG_STATE_HOME differs from the worker unit"
+echo "[WARN] Sandbox userns — restricted"
+exit 1'
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
+    [[ "$output" == *"warning: sdlc doctor warned (exit 1)"*"Run registry path, Sandbox userns"* ]]
+    [[ "$output" == *"done."* ]]
+}
+
 # Story 35.2-018: on dev-server the unit was enabled twice while it could not run — once
 # with an `sdlc` that crashed on import, once with a queue that refused the box (403) —
 # and restart-looped. Neither is a FAIL only a running unit clears.
@@ -1328,6 +1346,21 @@ exit 0'
     [ "$status" -eq 1 ]
     [[ "$output" == *"[WARN] Worker Keychain"* ]]
     [[ "$output" == *"login Keychain"* ]]
+    [ -e "$(AGENT worker)" ] && [ -e "$(AGENT dashboard)" ]
+}
+
+@test "a Mac whose setup doctor only WARNs exits 0 (Story 35.2-020)" {
+    darwin
+    stub sdlc '
+if [ "$1 $2" = "queue list" ]; then echo "{\"jobs\": []}"; exit 0; fi
+case " $* " in *" --only worker-keychain "*) exit 0 ;; esac
+echo "[WARN] Run registry path — differs"
+exit 1'
+
+    run mac
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"sdlc doctor warned (exit 1)"*"Run registry path"* ]]
     [ -e "$(AGENT worker)" ] && [ -e "$(AGENT dashboard)" ]
 }
 
