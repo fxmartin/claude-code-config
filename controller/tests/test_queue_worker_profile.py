@@ -76,6 +76,28 @@ def test_sandbox_is_the_container_runtime_or_nothing(tmp_path) -> None:
     assert detect_worker_profile("w", runtime=_runtime(None), **kwargs).sandbox is None
 
 
+@pytest.mark.parametrize(
+    ("pinned", "override", "advertised"),
+    [
+        (None, "", None),  # deploy.sh --skip-sandbox-image: podman, but no image
+        ("sha256:" + "d" * 64, "", "podman"),
+        (None, "sdlc-agent-sandbox:local", "podman"),  # $SDLC_SANDBOX_IMAGE stands in
+    ],
+)
+def test_a_runtime_without_a_sandbox_image_is_no_sandbox(
+    tmp_path, monkeypatch, pinned, override, advertised
+) -> None:
+    # Story 35.2-016: SDLC_SANDBOX=1 refuses without an image, so a worker whose podman
+    # could not build one must not match a sandbox job just for having podman on PATH.
+    monkeypatch.setattr("sdlc.dispatch.detect_container_runtime", lambda: "podman")
+    monkeypatch.setattr("sdlc.dispatch.pinned_sandbox_image", lambda arch=None: pinned)
+    monkeypatch.setenv("SDLC_SANDBOX_IMAGE", override)
+
+    profile = detect_worker_profile("w", work_dir=tmp_path, probe=lambda tool: False)
+
+    assert profile.sandbox == advertised
+
+
 def test_host_defaults_to_the_short_hostname_and_can_be_overridden(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("sdlc.queue_worker.socket.gethostname", lambda: "home-lab.local")
     kwargs = {"work_dir": tmp_path, "probe": lambda tool: False, "runtime": _runtime(None)}

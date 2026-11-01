@@ -28,6 +28,7 @@
 #   2. claude plugin marketplace add / install   the fx-claude-config marketplace
 #                                                and the autonomous-sdlc plugin
 #   3. scripts/deploy.sh                      plugin update + `sdlc` as a uv tool
+#                                                (+ --skip-sandbox-image when given)
 #   4. gh auth setup-git (+ glab's helper)    git authenticates through gh/glab, never a prompt
 #   5. ~/.sdlc-fleet.yaml                     queue_url: names the fleet queue
 #   6. `sdlc doctor --exit-code`              the verdict on steps 1-5 (skipping the checks
@@ -62,9 +63,11 @@
 # goes on: its credential helpers are declared there.
 #
 # Usage:
-#   scripts/fleet-bootstrap.sh --queue-url URL [--github-only] [--skip-service] [--dry-run]
+#   scripts/fleet-bootstrap.sh --queue-url URL [--github-only] [--skip-service]
+#       [--skip-sandbox-image] [--dry-run]
 #   scripts/fleet-bootstrap.sh --worker NAME --pool P [--pool P ...] [--host HOST] [--slots N] \
-#       --queue-url URL [--queue-service [--queue-allow LOGIN]] [--github-only] [--skip-service] [--dry-run]
+#       --queue-url URL [--queue-service [--queue-allow LOGIN]] [--github-only] [--skip-service]
+#       [--skip-sandbox-image] [--dry-run]
 #   scripts/fleet-bootstrap.sh --help
 #
 # --queue-url  the fleet queue's base URL (written to ~/.sdlc-fleet.yaml). Optional
@@ -77,6 +80,12 @@
 #              box without systemd --user), the LaunchAgents on a Mac — so it needs no
 #              tailnet address. Starting no worker, it is not refused for a missing
 #              glab or scanner.
+# --skip-sandbox-image  passed to deploy.sh: the box's podman cannot build the agent
+#              sandbox image — on Ubuntu, kernel.apparmor_restrict_unprivileged_userns = 1
+#              and a /nix/store podman outside every AppArmor profile (`sdlc doctor`'s
+#              sandbox-userns check says so; step 6 then skips that check, which the
+#              flag answers). Without a pinned image the worker advertises no
+#              sandbox, so SDLC_SANDBOX=1 jobs go to other workers.
 # --dry-run    print what would run, and on a Mac the diff of every agent it would
 #              replace; change nothing.
 #
@@ -156,6 +165,8 @@ QUEUE_ALLOW=""
 DO_SERVICE=true
 DRY_RUN=false
 GITHUB_ONLY=false
+SKIP_SANDBOX_IMAGE=false
+DEPLOY_ARGS=()
 
 usage() {
   # The header comment from line 5 to its end: no line number to keep in step with it.
@@ -181,6 +192,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)       DRY_RUN=true ;;
     --github-only)   GITHUB_ONLY=true ;;
     --skip-service)  DO_SERVICE=false ;;
+    --skip-sandbox-image) SKIP_SANDBOX_IMAGE=true; DEPLOY_ARGS+=(--skip-sandbox-image) ;;
     --queue-service) QUEUE_SERVICE=true ;;
     --worker)        [[ $# -ge 2 ]] || die "--worker needs a name"; WORKER_NAME="$2"; shift ;;
     --worker=*)      WORKER_NAME="${1#--worker=}" ;;
@@ -344,8 +356,8 @@ else
 fi
 
 # 3. Plugin pointer + the `sdlc` controller as a uv tool.
-log "scripts/deploy.sh"
-run "${DEPLOY_SH}"
+log "scripts/deploy.sh ${DEPLOY_ARGS[*]-}"
+run "${DEPLOY_SH}" ${DEPLOY_ARGS[@]+"${DEPLOY_ARGS[@]}"}
 
 # 4. git authenticates through each forge CLI's credential helper; with
 #    GIT_TERMINAL_PROMPT=0 (the unit sets it) a missing credential fails at once
@@ -419,7 +431,8 @@ installed_token() { installed_env "$1" "${TOKEN_KEY}"; }  # LABEL — the instal
 #    restart exits 1. Linux judges its units the same way (35.2-010). On a Mac
 #    worker-keychain is n/a until step 7 installs the worker agent, so the
 #    summary judges it instead (Story 35.2-014). A doctor that crashes is fatal
-#    here, though: the worker runs the same `sdlc` (Story 35.2-018).
+#    here, though: the worker runs the same `sdlc` (Story 35.2-018). --skip-sandbox-image
+#    answers sandbox-userns: it WARNs on every box the flag is for (Story 35.2-016).
 #    Rendered copies and doctor's stderr live in a scratch directory, so a dry run
 #    can diff the units and a real one can compare them byte for byte.
 WORK_DIR="$(mktemp -d)"
@@ -430,6 +443,7 @@ if [[ "${DO_SERVICE}" == true ]]; then
   DOCTOR_ARGS+=(--skip fleet-agent-drift --skip worker-dashboard)
   [[ "${IS_DARWIN}" == false ]] || DOCTOR_ARGS+=(--skip worker-keychain)
 fi
+[[ "${SKIP_SANDBOX_IMAGE}" == false ]] || DOCTOR_ARGS+=(--skip sandbox-userns)
 if [[ "${DRY_RUN}" == true ]]; then
   log "[dry-run] would run: sdlc doctor ${DOCTOR_ARGS[*]}"
 else

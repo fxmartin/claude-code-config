@@ -2518,6 +2518,25 @@ reinstall the controller each time (`uv tool install --force`), which is
 harmless: the worker restarts only when the installed *version* changes.
 `--dry-run` prints the steps and `--skip-service` stops short of the unit.
 
+**A podman that cannot build the sandbox image** (Story 35.2-016). Ubuntu 24.04
+sets `kernel.apparmor_restrict_unprivileged_userns = 1`: only a binary an
+AppArmor profile attaches to may create the user namespace rootless podman
+needs. `/etc/apparmor.d/podman` covers `/usr/bin/podman`, not the dev shell's
+`/nix/store` one, so `podman info` works and `podman build` fails with
+`failed to reexec: Permission denied`. `deploy.sh`'s build error then names the
+sysctl, the runtime's path and the way out; `sdlc doctor`'s `sandbox-userns`
+check warns ahead of time, naming the same sysctl, podman's resolved path and
+both remedies — an AppArmor profile for that path (allowing `userns,`), or
+`fleet-bootstrap.sh --skip-sandbox-image`, which passes the flag to `deploy.sh`,
+bootstraps the rest and leaves `sandbox-userns` out of its doctor verdict (the
+flag is the answer to it, so the run still exits 0; a plain `sdlc doctor` on
+the box keeps warning). The check is n/a off Linux, on a kernel without the
+sysctl, and without podman; CLEAN when unrestricted or a profile attaches to
+podman; never FAIL. A worker advertises a sandbox only with both a container
+runtime and a pinned image (or `$SDLC_SANDBOX_IMAGE`), so a box deployed without
+the image registers none and `SDLC_SANDBOX=1` jobs go to workers that can run
+them.
+
 - **The unit.** `ExecStart` is `/nix/var/nix/profiles/default/bin/nix develop
   %h/.config/nix-dev-env -c sdlc queue run --worker dev --pool claude-shared
   --pool codex-shared --follow`: the nix binary by absolute path, then the dev

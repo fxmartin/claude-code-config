@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import ipaddress
 import itertools
 import json
@@ -63,6 +64,7 @@ __all__ = [
     "check_queue_whois",
     "check_registry_path",
     "check_run_versions",
+    "check_sandbox_userns",
     "check_stashes",
     "check_usage_agreement",
     "check_worker_dashboard",
@@ -1552,6 +1554,86 @@ def check_worker_keychain(
     return Finding("worker-keychain", name, "CLEAN", f"the login Keychain never locks on its own ({' '.join(settings)})")
 
 
+# Story 35.2-016: Ubuntu lets only binaries an AppArmor profile attaches to create
+# unprivileged user namespaces. /etc/apparmor.d/podman covers /usr/bin/podman, but a
+# dev shell's podman lives in /nix/store: `podman info` works, `podman build` fails
+# with `failed to reexec: Permission denied`, and deploy.sh cannot build the image.
+_USERNS_SYSCTL = "kernel.apparmor_restrict_unprivileged_userns"
+_USERNS_SYSCTL_PATH = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+_APPARMOR_PROFILE_DIR = Path("/etc/apparmor.d")
+# A profile header's attachment: `profile NAME /path … {`, `profile /path {` or `/path {`.
+# Rules (`/nix/store/** rix,`) end in a comma, not a `{`, so they never match; a comma
+# inside parentheses (`flags=(unconfined,attach_disconnected)`) separates flags instead.
+_APPARMOR_ATTACHMENT_RE = re.compile(r"^\s*(?:profile\s+(?:[^\s/]\S*\s+)?)?(/[^\s{]+)(?:[^{,(]|\([^)]*\))*\{")
+
+
+def _read_userns_sysctl() -> str | None:
+    try:
+        return _USERNS_SYSCTL_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _apparmor_attachments(profile_dir: Path) -> list[str]:
+    """The executable paths (globs allowed) the profiles in ``profile_dir`` attach to."""
+    try:
+        files = [path for path in profile_dir.iterdir() if path.is_file()]
+    except OSError:
+        return []
+    attachments: list[str] = []
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        attachments += [m.group(1) for m in map(_APPARMOR_ATTACHMENT_RE.match, text.splitlines()) if m]
+    return attachments
+
+
+def check_sandbox_userns(
+    *,
+    system: str | None = None,
+    read_sysctl: Callable[[], str | None] | None = None,
+    which: Callable[[str], str | None] | None = None,
+    profile_dir: Path | None = None,
+) -> Finding | None:
+    """Can rootless podman build the sandbox image under AppArmor? (Story 35.2-016)
+
+    ``None`` (n/a) off Linux, on a kernel without the sysctl, and without podman.
+    CLEAN when user namespaces are unrestricted or a profile attaches to podman's
+    resolved path. WARN otherwise — never FAIL: the host still works as a worker,
+    only without the sandbox (``--skip-sandbox-image``).
+    """
+    if (system or platform.system()) != "Linux":
+        return None
+    restricted = (read_sysctl or _read_userns_sysctl)()
+    if restricted is None:
+        return None
+    name = "Sandbox user namespaces"
+    if restricted != "1":
+        return Finding("sandbox-userns", name, "CLEAN", f"{_USERNS_SYSCTL} = {restricted}: user namespaces are not restricted")
+    podman = (which or shutil.which)("podman")
+    if podman is None:
+        return None
+    resolved = os.path.realpath(podman)
+    profiles = profile_dir or _APPARMOR_PROFILE_DIR
+    attachments = _apparmor_attachments(profiles)
+    if any(fnmatch.fnmatchcase(path, glob) for glob in attachments for path in {podman, resolved}):
+        return Finding(
+            "sandbox-userns", name, "CLEAN",
+            f"{_USERNS_SYSCTL} = 1, and an AppArmor profile in {profiles} covers podman ({resolved})",
+        )
+    return Finding(
+        "sandbox-userns", name, "WARN",
+        f"{_USERNS_SYSCTL} = 1 and podman ({resolved}) is outside every AppArmor profile in "
+        f"{profiles}: rootless `podman build` fails (failed to reexec: Permission denied), so "
+        "the sandbox image cannot be built here",
+        f"give {resolved} an AppArmor profile that allows `userns,` (as /etc/apparmor.d/podman "
+        "does for /usr/bin/podman), or bootstrap without the sandbox: "
+        "scripts/fleet-bootstrap.sh --skip-sandbox-image (scripts/deploy.sh --skip-sandbox-image)",
+    )
+
+
 def check_queue(queue_path: Path) -> Finding:
     """Verify the host-level development queue is readable and current.
 
@@ -2760,4 +2842,7 @@ def run_doctor(
     keychain = check_worker_keychain(agent_path=worker_plist)
     if keychain is not None:
         findings.append(keychain)
+    userns = check_sandbox_userns()
+    if userns is not None:
+        findings.append(userns)
     return DoctorReport(findings=findings)

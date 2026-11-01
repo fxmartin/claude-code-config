@@ -117,6 +117,19 @@ def _no_real_keychain(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_userns_sysctl(monkeypatch):
+    """Never read the real AppArmor userns sysctl (Story 35.2-016).
+
+    On `dev` (Ubuntu, restricted, podman in /nix/store) a `run_doctor` test would
+    otherwise gain a `sandbox-userns` WARN. Absent reads as n/a;
+    test_doctor_sandbox_userns.py injects its own reader.
+    """
+    from sdlc import doctor
+
+    monkeypatch.setattr(doctor, "_read_userns_sysctl", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_model_probe(monkeypatch):
     """Never spend a real ``claude -p`` call on the model entitlement probe.
 

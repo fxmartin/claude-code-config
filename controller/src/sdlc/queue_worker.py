@@ -152,6 +152,20 @@ def _harness_binaries() -> dict[str, str]:
     return binaries or {"claude": "claude"}
 
 
+def _sandbox_runtime() -> str:
+    """The container runtime a sandbox job would run with, or raise ``SandboxUnavailableError``.
+
+    A runtime alone is not a sandbox: ``SDLC_SANDBOX=1`` also needs the image deploy.sh
+    pins, so a box deployed with ``--skip-sandbox-image`` (its podman cannot build one,
+    Story 35.2-016) advertises none, and sandbox jobs go to a worker that can run them.
+    """
+    from sdlc import dispatch
+
+    runtime = dispatch.detect_container_runtime()
+    dispatch._resolve_sandbox_image()
+    return runtime
+
+
 def detect_worker_profile(
     name: str,
     *,
@@ -167,7 +181,7 @@ def detect_worker_profile(
     """Probe this machine for what it can run.
 
     ``probe`` is doctor's dependency probe (a tool on PATH that answers
-    ``--version``) and ``runtime`` the sandbox's container-runtime detection —
+    ``--version``) and ``runtime`` the sandbox's runtime-and-image detection —
     both injectable so a test never depends on the machine it runs on. Pools are
     declared, not detected: they name a subscription, and only the operator
     knows which one this machine is logged into. A declared :data:`CODEX_POOL`
@@ -178,7 +192,7 @@ def detect_worker_profile(
     CLI is logged in there. ``system`` is :func:`platform.system`, injectable like the
     rest; its lower-cased answer is the platform the worker advertises.
     """
-    from sdlc.dispatch import SandboxUnavailableError, detect_container_runtime
+    from sdlc.dispatch import SandboxUnavailableError
     from sdlc.doctor import _default_dep_probe
     from sdlc.queue import CODEX_POOL
 
@@ -196,7 +210,7 @@ def detect_worker_profile(
     if "codex" not in harnesses:
         declared = [pool for pool in declared if pool != CODEX_POOL]
     try:
-        sandbox: str | None = (runtime or detect_container_runtime)()
+        sandbox: str | None = (runtime or _sandbox_runtime)()
     except SandboxUnavailableError:
         sandbox = None
     clones_dir = work_dir if work_dir is not None else default_work_dir()
