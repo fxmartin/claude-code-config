@@ -136,6 +136,12 @@ Omarchy ships its own Claude skills (`omarchy`, `diagnose-crash`) as symlinks in
 `--core` preserves all of them: it only adds this repo's skills alongside, and
 `--uninstall` removes only the links it created.
 
+A real directory where one of this repo's skills should be linked (an old copy
+from before skills were linked individually) is left alone, and `--core` ends
+with a warning naming it. `./install.sh --core --replace-stale-skills` moves
+each such directory to `~/.claude/skills/.replaced-<timestamp>/<name>` (never
+deleting it) and links the skill; foreign skills are never touched.
+
 `dev <dir>` opens a tmux session named after the directory with three windows:
 `claude` (runs `claude` when the directory is a git repo), `terminal`, and
 `yazi`. Switch windows with `prefix + n` / `prefix + p`; running `dev` again

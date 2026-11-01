@@ -18,6 +18,7 @@ MODE_TOOLS=false
 MODE_MCP=false
 MODE_SHELL=false
 PREFER_BREW=false
+REPLACE_STALE_SKILLS=false
 
 # Legacy compat: --skip-mcp / --skip-tools (default-on opt-out). These will
 # be removed in the next MAJOR release.
@@ -39,6 +40,10 @@ Options:
   --dry-run     Preview every action without making changes.
   --uninstall   Remove symlinks created by --core. Does not touch tools, MCP, or shellrc.
   --prefer-brew On WSL2, use Homebrew for --tools even when apt is available.
+  --replace-stale-skills
+                With --core, move a real ~/.claude/skills/<name> directory that
+                blocks a shipped skill's link into
+                ~/.claude/skills/.replaced-<timestamp>/ (never deleted), then link.
   --help        Show this help.
 
 Backward-compatible (deprecated, removed in next MAJOR):
@@ -59,6 +64,7 @@ for arg in "$@"; do
     --dry-run)     DRY_RUN=true ;;
     --uninstall)   UNINSTALL=true ;;
     --prefer-brew) PREFER_BREW=true ;;
+    --replace-stale-skills) REPLACE_STALE_SKILLS=true ;;
     --skip-mcp)    LEGACY_SKIP_MCP=true ;;
     --skip-tools)  LEGACY_SKIP_TOOLS=true ;;
     --help|-h)     usage ;;
@@ -86,7 +92,7 @@ if ! $MODE_CORE && ! $MODE_TOOLS && ! $MODE_MCP && ! $MODE_SHELL && ! $UNINSTALL
 fi
 
 # Export everything the modules need before sourcing.
-export SCRIPT_DIR CLAUDE_DIR CLAUDE_JSON BACKUP_DIR DRY_RUN PREFER_BREW
+export SCRIPT_DIR CLAUDE_DIR CLAUDE_JSON BACKUP_DIR DRY_RUN PREFER_BREW REPLACE_STALE_SKILLS
 
 # ─── Load modules ────────────────────────────────────────────────────
 # shellcheck source=install/common.sh
@@ -136,3 +142,5 @@ echo ""
 echo "Verify with:"
 echo "  ls -la ~/.claude/CLAUDE.md"
 echo "  claude mcp list"
+# Last on purpose: a stale skill copy must not scroll away behind the summary.
+if $MODE_CORE; then report_blocked_skills; fi
