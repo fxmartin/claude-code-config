@@ -7,6 +7,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -343,6 +344,31 @@ def test_install_missing_paths_still_fail_over_blocked_skills(tmp_path: Path) ->
     (claude_dir / "skills" / "telegram").mkdir()
     (claude_dir / "hooks").unlink()
     assert _install_finding(tmp_path, claude_dir, repo_root).status == "FAIL"
+
+
+def test_install_legacy_directory_level_skills_link_has_nothing_to_block(tmp_path: Path) -> None:
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    assert (claude_dir / "skills").is_symlink()
+    assert _install_finding(tmp_path, claude_dir, repo_root).status == "CLEAN"
+
+
+def test_install_unreadable_shipped_skills_dir_does_not_warn(tmp_path: Path) -> None:
+    claude_dir, repo_root = _per_skill_install(tmp_path)
+    (claude_dir / "skills" / "telegram").unlink()
+    (claude_dir / "skills" / "telegram").mkdir()
+    shutil.rmtree(repo_root / "skills")
+    assert _install_finding(tmp_path, claude_dir, repo_root).status == "CLEAN"
+
+
+def test_install_reports_blocked_skills_alongside_the_stale_marketplace(tmp_path: Path) -> None:
+    claude_dir, repo_root = _per_skill_install(tmp_path)
+    (claude_dir / "skills" / "telegram").unlink()
+    (claude_dir / "skills" / "telegram").mkdir()
+    (claude_dir / "plugins" / "marketplaces" / "fx-claude-config").mkdir(parents=True)
+    install = _install_finding(tmp_path, claude_dir, repo_root)
+    assert install.status == "WARN"
+    assert "stale marketplace" in install.detail and "telegram" in install.detail
+    assert "rm -rf" in install.remedy and "--replace-stale-skills" in install.remedy
 
 
 def test_foreign_skill_names_match_install_core_sh() -> None:
