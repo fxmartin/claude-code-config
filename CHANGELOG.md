@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.130.0] - 2026-11-01
+
+### Added
+
+- feat(fleet-execution): a worker that cannot build the (#35.2-016) (#957)
+
+
 ## [v2.129.0] - 2026-11-01
 
 ### Added
