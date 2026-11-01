@@ -9,6 +9,8 @@ from sdlc import doctor
 
 NIX_PODMAN = "/nix/store/abc123-podman-5.2.0/bin/podman"
 SYSCTL = "kernel.apparmor_restrict_unprivileged_userns"
+# Captured at import: the autouse conftest fixture replaces doctor._read_userns_sysctl per test.
+REAL_READ_USERNS_SYSCTL = doctor._read_userns_sysctl
 
 
 def _profiles(tmp_path: Path, **files: str) -> Path:
@@ -121,3 +123,25 @@ def test_run_doctor_reports_it_only_where_the_check_applies(tmp_path, monkeypatc
     monkeypatch.setattr(doctor, "check_sandbox_userns", lambda **_: None)
     report = doctor.run_doctor(repo_root=tmp_path)
     assert all(f.check != "sandbox-userns" for f in report.findings)
+
+
+def test_the_sysctl_reader_strips_the_value_and_reads_a_missing_file_as_none(tmp_path, monkeypatch) -> None:
+    sysctl = tmp_path / "restrict"
+    sysctl.write_text("1\n")
+    monkeypatch.setattr(doctor, "_USERNS_SYSCTL_PATH", sysctl)
+    assert REAL_READ_USERNS_SYSCTL() == "1"
+    monkeypatch.setattr(doctor, "_USERNS_SYSCTL_PATH", tmp_path / "absent")
+    assert REAL_READ_USERNS_SYSCTL() is None
+
+
+def test_an_unreadable_profile_is_skipped_not_fatal(tmp_path, monkeypatch) -> None:
+    profile_dir = _profiles(tmp_path, podman=UBUNTU_PODMAN, broken="profile x /y {\n")
+    real_read_text = Path.read_text
+
+    def flaky(self: Path, *args, **kwargs):
+        if self.name == "broken":
+            raise PermissionError("unreadable")  # injected: chmod is a no-op as root in CI
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    assert doctor._apparmor_attachments(profile_dir) == ["/usr/bin/podman"]
