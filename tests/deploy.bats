@@ -78,6 +78,10 @@ EOF
         x86_64|amd64) ARCH=amd64 ;;
         aarch64|arm64) ARCH=arm64 ;;
     esac
+
+    # No run reads the real AppArmor userns sysctl (Story 35.2-016): absent reads as
+    # unrestricted; a test that needs a value writes its own fixture.
+    export USERNS_SYSCTL="${TMP}/userns-absent"
 }
 
 teardown() {

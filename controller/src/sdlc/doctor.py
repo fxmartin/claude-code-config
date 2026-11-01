@@ -1514,8 +1514,9 @@ _USERNS_SYSCTL = "kernel.apparmor_restrict_unprivileged_userns"
 _USERNS_SYSCTL_PATH = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
 _APPARMOR_PROFILE_DIR = Path("/etc/apparmor.d")
 # A profile header's attachment: `profile NAME /path … {`, `profile /path {` or `/path {`.
-# Rules (`/nix/store/** rix,`) end in a comma, not a `{`, so they never match.
-_APPARMOR_ATTACHMENT_RE = re.compile(r"^\s*(?:profile\s+(?:[^\s/]\S*\s+)?)?(/[^\s{]+)[^{,]*\{")
+# Rules (`/nix/store/** rix,`) end in a comma, not a `{`, so they never match; a comma
+# inside parentheses (`flags=(unconfined,attach_disconnected)`) separates flags instead.
+_APPARMOR_ATTACHMENT_RE = re.compile(r"^\s*(?:profile\s+(?:[^\s/]\S*\s+)?)?(/[^\s{]+)(?:[^{,(]|\([^)]*\))*\{")
 
 
 def _read_userns_sysctl() -> str | None:

@@ -78,8 +78,9 @@
 # --skip-sandbox-image  passed to deploy.sh: the box's podman cannot build the agent
 #              sandbox image — on Ubuntu, kernel.apparmor_restrict_unprivileged_userns = 1
 #              and a /nix/store podman outside every AppArmor profile (`sdlc doctor`'s
-#              sandbox-userns check says so). Without a pinned image the worker
-#              advertises no sandbox, so SDLC_SANDBOX=1 jobs go to other workers.
+#              sandbox-userns check says so; step 6 then skips that check, which the
+#              flag answers). Without a pinned image the worker advertises no
+#              sandbox, so SDLC_SANDBOX=1 jobs go to other workers.
 # --dry-run    print what would run, and on a Mac the diff of every agent it would
 #              replace; change nothing.
 #
@@ -159,6 +160,7 @@ QUEUE_ALLOW=""
 DO_SERVICE=true
 DRY_RUN=false
 GITHUB_ONLY=false
+SKIP_SANDBOX_IMAGE=false
 DEPLOY_ARGS=()
 
 usage() {
@@ -185,7 +187,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)       DRY_RUN=true ;;
     --github-only)   GITHUB_ONLY=true ;;
     --skip-service)  DO_SERVICE=false ;;
-    --skip-sandbox-image) DEPLOY_ARGS+=(--skip-sandbox-image) ;;
+    --skip-sandbox-image) SKIP_SANDBOX_IMAGE=true; DEPLOY_ARGS+=(--skip-sandbox-image) ;;
     --queue-service) QUEUE_SERVICE=true ;;
     --worker)        [[ $# -ge 2 ]] || die "--worker needs a name"; WORKER_NAME="$2"; shift ;;
     --worker=*)      WORKER_NAME="${1#--worker=}" ;;
@@ -423,13 +425,15 @@ installed_token() { installed_env "$1" "${TOKEN_KEY}"; }  # LABEL — the instal
 #    run that repairs them. Step 7 answers for them — a worker it leaves pending
 #    restart exits 1. Linux judges its units the same way (35.2-010). On a Mac
 #    worker-keychain is n/a until step 7 installs the worker agent, so the
-#    summary judges it instead (Story 35.2-014).
+#    summary judges it instead (Story 35.2-014). --skip-sandbox-image answers
+#    sandbox-userns: it WARNs on every box the flag is for (Story 35.2-016).
 DOCTOR_RC=0
 DOCTOR_ARGS=(--exit-code)
 if [[ "${DO_SERVICE}" == true ]]; then
   DOCTOR_ARGS+=(--skip fleet-agent-drift --skip worker-dashboard)
   [[ "${IS_DARWIN}" == false ]] || DOCTOR_ARGS+=(--skip worker-keychain)
 fi
+[[ "${SKIP_SANDBOX_IMAGE}" == false ]] || DOCTOR_ARGS+=(--skip sandbox-userns)
 if [[ "${DRY_RUN}" == true ]]; then
   log "[dry-run] would run: sdlc doctor ${DOCTOR_ARGS[*]}"
 else

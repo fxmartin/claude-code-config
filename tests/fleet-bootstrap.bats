@@ -304,6 +304,18 @@ exit 0'
     grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
 }
 
+@test "--skip-sandbox-image leaves sandbox-userns out of doctor's verdict, with or without the unit" {
+    # On the box the flag is for, sandbox-userns always WARNs: counted, every run would exit 1.
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --skip-sandbox-image
+    [ "$status" -eq 0 ]
+    grep -qx "sdlc doctor --exit-code --skip fleet-agent-drift --skip worker-dashboard --skip sandbox-userns" "${CALLS}"
+
+    : >"${CALLS}"
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --skip-sandbox-image --skip-service
+    [ "$status" -eq 0 ]
+    grep -qx "sdlc doctor --exit-code --skip sandbox-userns" "${CALLS}"
+}
+
 @test "--skip-sandbox-image is documented in --help" {
     run "${BOOTSTRAP}" --help
 

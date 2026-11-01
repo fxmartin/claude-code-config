@@ -85,6 +85,17 @@ def test_a_globbed_or_path_named_profile_counts(tmp_path) -> None:
     assert _check(tmp_path, podman="/opt/podman/bin/podman", profile_dir=profiles).status == "CLEAN"
 
 
+def test_a_profile_with_several_flags_counts(tmp_path) -> None:
+    # The commas inside `flags=(…)` separate flags; they do not end a rule.
+    profiles = _profiles(
+        tmp_path,
+        nix="profile nixpodman /nix/store/*/bin/podman flags=(unconfined,attach_disconnected) {\n  userns,\n}\n",
+        spaced="/opt/podman/bin/podman flags=(complain, attach_disconnected) {\n}\n",
+    )
+    assert _check(tmp_path, profile_dir=profiles).status == "CLEAN"
+    assert _check(tmp_path, podman="/opt/podman/bin/podman", profile_dir=profiles).status == "CLEAN"
+
+
 def test_a_rule_inside_a_profile_is_not_an_attachment(tmp_path) -> None:
     profiles = _profiles(tmp_path, other="profile foo /usr/bin/foo {\n  /nix/store/** rix,\n}\n")
 

@@ -2514,8 +2514,10 @@ needs. `/etc/apparmor.d/podman` covers `/usr/bin/podman`, not the dev shell's
 sysctl, the runtime's path and the way out; `sdlc doctor`'s `sandbox-userns`
 check warns ahead of time, naming the same sysctl, podman's resolved path and
 both remedies — an AppArmor profile for that path (allowing `userns,`), or
-`fleet-bootstrap.sh --skip-sandbox-image`, which passes the flag to `deploy.sh`
-and bootstraps the rest. The check is n/a off Linux, on a kernel without the
+`fleet-bootstrap.sh --skip-sandbox-image`, which passes the flag to `deploy.sh`,
+bootstraps the rest and leaves `sandbox-userns` out of its doctor verdict (the
+flag is the answer to it, so the run still exits 0; a plain `sdlc doctor` on
+the box keeps warning). The check is n/a off Linux, on a kernel without the
 sysctl, and without podman; CLEAN when unrestricted or a profile attaches to
 podman; never FAIL. A worker advertises a sandbox only with both a container
 runtime and a pinned image (or `$SDLC_SANDBOX_IMAGE`), so a box deployed without
