@@ -1511,7 +1511,10 @@ it on the next real run).
     path exists. Unregistered or dangling → `FAIL`, same remedy. A leftover
     `plugins/marketplaces/fx-claude-config` (symlink or directory) is a stale
     install location → `WARN` to remove it; it never counts as the marketplace
-    being present.
+    being present. A real directory at `~/.claude/skills/<name>` for a skill the
+    install clone ships blocks that skill's link, so agents run a stale copy
+    (Story 35.2-017) → `WARN` naming the skills, remedy
+    `./install.sh --core --replace-stale-skills`; foreign skills never count.
   - **Installed controller vs checkout** (Story 15.1-004) — compares
     `sdlc.__version__` (the PATH-installed `uv tool install` snapshot) against
     `[project].version` in the target repo's `controller/pyproject.toml` (the

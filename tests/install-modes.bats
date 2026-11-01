@@ -563,6 +563,61 @@ _run_install() {
     [ -L "$sk/create-skill" ]
 }
 
+@test "--core ends with a WARN listing blocked skills and the replace command (35.2-017)" {
+    local sk="${FAKE_HOME}/.claude/skills"
+    mkdir -p "$sk/telegram" "$sk/demo" "$sk/foreign-real"
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [ -d "$sk/telegram" ] && [ ! -L "$sk/telegram" ]
+    [ -d "$sk/demo" ] && [ ! -L "$sk/demo" ]
+    last="$(printf '%s\n' "$output" | tail -n 1)"
+    [[ "$last" == *"⚠"* ]]
+    [[ "$last" == *"demo"* ]]
+    [[ "$last" == *"telegram"* ]]
+    [[ "$last" == *"--replace-stale-skills"* ]]
+    [[ "$last" != *"foreign-real"* ]]
+}
+
+@test "--core prints no blocked-skills WARN when nothing blocks a link (35.2-017)" {
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"--replace-stale-skills"* ]]
+}
+
+@test "--core --replace-stale-skills moves a blocking dir aside then links it (35.2-017)" {
+    local sk="${FAKE_HOME}/.claude/skills"
+    mkdir -p "$sk/telegram" "$sk/foreign-real"
+    echo mine > "$sk/telegram/SKILL.md"
+    echo theirs > "$sk/foreign-real/SKILL.md"
+    _run_install --core --replace-stale-skills
+    [ "$status" -eq 0 ]
+    [ -L "$sk/telegram" ]
+    [ "$(readlink "$sk/telegram")" = "$(cd "${BATS_TEST_DIRNAME}/.." && pwd)/skills/telegram" ]
+    moved=( "$sk"/.replaced-*/telegram )
+    [ "${#moved[@]}" -eq 1 ]
+    [ "$(cat "${moved[0]}/SKILL.md")" = "mine" ]
+    # The foreign skill is never moved.
+    [ "$(cat "$sk/foreign-real/SKILL.md")" = "theirs" ]
+    [ ! -e "$sk"/.replaced-*/foreign-real ]
+    [[ "$output" != *"Skipping skill"* ]]
+}
+
+@test "--core --replace-stale-skills --dry-run changes nothing (35.2-017)" {
+    local sk="${FAKE_HOME}/.claude/skills"
+    mkdir -p "$sk/telegram"
+    _run_install --core --replace-stale-skills --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[dry-run] mv $sk/telegram $sk/.replaced-"* ]]
+    [ -d "$sk/telegram" ] && [ ! -L "$sk/telegram" ]
+    ! compgen -G "$sk/.replaced-*" >/dev/null
+    [ ! -e "${FAKE_HOME}/.claude/backups" ]
+}
+
+@test "--help documents --replace-stale-skills (35.2-017)" {
+    _run_install --help
+    [[ "$output" == *"--replace-stale-skills"* ]]
+}
+
 @test "--core seeds settings.json from the template in a fresh clone (#693)" {
     CLONE="$(mktemp -d)"
     git -C "${BATS_TEST_DIRNAME}/.." ls-files -z | (cd "${BATS_TEST_DIRNAME}/.." && xargs -0 -I{} cp --parents -P {} "${CLONE}" 2>/dev/null) || true

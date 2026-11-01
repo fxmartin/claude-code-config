@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import re
 import socket
 import sqlite3
 import subprocess
@@ -20,6 +21,7 @@ from sdlc.build import Ledger
 from sdlc.cli import app
 from sdlc.doctor import (
     check_run_versions,
+    FOREIGN_SKILL_NAMES,
     MANAGED_PATHS,
     DoctorReport,
     Finding,
@@ -294,6 +296,62 @@ def test_install_unreadable_settings_fails_the_marketplace(tmp_path: Path) -> No
     claude_dir, repo_root = _healthy_install(tmp_path)
     (repo_root / "settings.json").write_text("{not json", encoding="utf-8")
     assert _install_finding(tmp_path, claude_dir, repo_root).status == "FAIL"
+
+
+# --- skills blocked by a real directory (35.2-017) ---------------------------
+
+
+def _per_skill_install(tmp_path: Path, shipped: tuple[str, ...] = ("telegram", "demo")) -> tuple[Path, Path]:
+    """A healthy install whose ~/.claude/skills is a real dir of per-skill links."""
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    (claude_dir / "skills").unlink()
+    (claude_dir / "skills").mkdir()
+    for name in shipped:
+        (repo_root / "skills" / name).mkdir(parents=True)
+        (claude_dir / "skills" / name).symlink_to(repo_root / "skills" / name)
+    return claude_dir, repo_root
+
+
+def test_install_per_skill_links_are_clean(tmp_path: Path) -> None:
+    claude_dir, repo_root = _per_skill_install(tmp_path)
+    assert _install_finding(tmp_path, claude_dir, repo_root).status == "CLEAN"
+
+
+def test_install_real_dir_blocking_a_shipped_skill_warns(tmp_path: Path) -> None:
+    claude_dir, repo_root = _per_skill_install(tmp_path)
+    for name in ("telegram", "demo"):
+        (claude_dir / "skills" / name).unlink()
+        (claude_dir / "skills" / name).mkdir()
+    install = _install_finding(tmp_path, claude_dir, repo_root)
+    assert install.status == "WARN"
+    assert "demo, telegram" in install.detail
+    assert "--replace-stale-skills" in install.remedy
+
+
+def test_install_foreign_skill_dir_does_not_warn(tmp_path: Path) -> None:
+    claude_dir, repo_root = _per_skill_install(tmp_path)
+    (claude_dir / "skills" / "my-own-skill").mkdir()
+    # A runtime leftover in the clone's skills/ is not a shipped skill (#694).
+    (repo_root / "skills" / "synced").mkdir()
+    (claude_dir / "skills" / "synced").mkdir()
+    assert _install_finding(tmp_path, claude_dir, repo_root).status == "CLEAN"
+
+
+def test_install_missing_paths_still_fail_over_blocked_skills(tmp_path: Path) -> None:
+    claude_dir, repo_root = _per_skill_install(tmp_path)
+    (claude_dir / "skills" / "telegram").unlink()
+    (claude_dir / "skills" / "telegram").mkdir()
+    (claude_dir / "hooks").unlink()
+    assert _install_finding(tmp_path, claude_dir, repo_root).status == "FAIL"
+
+
+def test_foreign_skill_names_match_install_core_sh() -> None:
+    """doctor's foreign-skill list must mirror install/core.sh's (35.2-017)."""
+    core_sh = (Path(__file__).resolve().parents[2] / "install" / "core.sh").read_text(encoding="utf-8")
+    match = re.search(r"_skill_entry_is_foreign\(\) \{\n  case \"\$1\" in\n    ([^)]+)\)", core_sh)
+    assert match is not None, "install/core.sh must define _skill_entry_is_foreign"
+    names = set(match.group(1).split("|")) - {".*"}
+    assert names == set(FOREIGN_SKILL_NAMES)
 
 
 # --- ledger schema + integrity ---------------------------------------------

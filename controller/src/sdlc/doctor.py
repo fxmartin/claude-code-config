@@ -44,6 +44,7 @@ from sdlc.registry import Registry, derive_state, registry_path_for
 from sdlc.worker_selfcheck import WORKER_UNIT
 
 __all__ = [
+    "FOREIGN_SKILL_NAMES",
     "MANAGED_PATHS",
     "DEPENDENCIES",
     "Finding",
@@ -87,6 +88,12 @@ MANAGED_PATHS: tuple[str, ...] = (
     "skills",
     "hooks",
 )
+
+# Entries of the clone's skills/ that are runtime/distro leftovers, not skills
+# the repo ships, along with any dot-entry (#694). Keep in sync with
+# install/core.sh's _skill_entry_is_foreign;
+# test_foreign_skill_names_match_install_core_sh asserts they never diverge.
+FOREIGN_SKILL_NAMES: tuple[str, ...] = ("synced", "omarchy", "diagnose-crash")
 
 # The plugin marketplace is not a managed path: since #743/#800 `install.sh
 # --core` registers it as a `directory` source in settings.json and removes the
@@ -217,6 +224,32 @@ def _marketplace_problem(claude_dir: Path) -> str | None:
     return None
 
 
+def _blocked_skills(claude_dir: Path) -> list[str]:
+    """Shipped skills whose ~/.claude/skills link is blocked by a real entry.
+
+    The shipped set is read from the clone ``CLAUDE.md`` links to — the same
+    ``skills/`` that ``install.sh --core`` links per entry. A legacy
+    directory-level ``skills`` symlink has no per-skill links to block.
+    """
+    skills_dst = claude_dir / "skills"
+    claude_md = claude_dir / "CLAUDE.md"
+    if skills_dst.is_symlink() or not claude_md.is_symlink():
+        return []
+    shipped_dir = claude_md.resolve().parent / "skills"
+    try:
+        shipped = [p.name for p in shipped_dir.iterdir()]
+    except OSError:
+        return []
+    return sorted(
+        name
+        for name in shipped
+        if not name.startswith(".")
+        and name not in FOREIGN_SKILL_NAMES
+        and (skills_dst / name).exists()
+        and not (skills_dst / name).is_symlink()
+    )
+
+
 def check_install(claude_dir: Path) -> Finding:
     """Verify the managed ~/.claude symlinks/files and the plugin marketplace."""
     if not claude_dir.exists():
@@ -245,13 +278,28 @@ def check_install(claude_dir: Path) -> Finding:
     # lexists, not exists: a dangling symlink is just as stale. It never counts
     # as the marketplace being present — the registration above decides that.
     legacy = claude_dir / _LEGACY_MARKETPLACE_PATH
+    warnings: list[tuple[str, str]] = []
     if os.path.lexists(legacy):
+        warnings.append((
+            f"stale marketplace install location {legacy} — Claude Code flags it as a corrupted installLocation",
+            f"remove it: rm -rf {legacy}",
+        ))
+    blocked = _blocked_skills(claude_dir)
+    if blocked:
+        warnings.append((
+            (
+                f"real directories under {claude_dir / 'skills'} block the links to shipped skills "
+                f"(stale copies that never update): {', '.join(blocked)}"
+            ),
+            "run: ./install.sh --core --replace-stale-skills (moves them to skills/.replaced-<timestamp>/)",
+        ))
+    if warnings:
         return Finding(
             "install",
             "Install integrity",
             "WARN",
-            f"stale marketplace install location {legacy} — Claude Code flags it as a corrupted installLocation",
-            f"remove it: rm -rf {legacy}",
+            "; ".join(detail for detail, _ in warnings),
+            "; ".join(remedy for _, remedy in warnings),
         )
     return Finding(
         "install",
