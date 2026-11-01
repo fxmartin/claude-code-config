@@ -385,6 +385,16 @@ def test_install_skills_symlink_into_another_checkout_warns_naming_it(tmp_path: 
     assert "--replace-stale-skills" not in install.remedy
 
 
+def test_install_skills_symlink_into_own_clone_is_not_foreign(tmp_path: Path) -> None:
+    """The legacy directory-level link into this clone is not flagged (35.2-019)."""
+    claude_dir, repo_root = _healthy_install(tmp_path)
+    (repo_root / "skills").mkdir(exist_ok=True)
+    (claude_dir / "skills").unlink(missing_ok=True)
+    (claude_dir / "skills").symlink_to(repo_root / "skills")
+    install = _install_finding(tmp_path, claude_dir, repo_root)
+    assert "symlink to" not in install.detail
+
+
 def test_foreign_skill_names_match_install_core_sh() -> None:
     """doctor's foreign-skill list must mirror install/core.sh's (35.2-017)."""
     core_sh = (Path(__file__).resolve().parents[2] / "install" / "core.sh").read_text(encoding="utf-8")

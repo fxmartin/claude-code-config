@@ -657,6 +657,17 @@ _symlink_skills_to_other_clone() {
     [[ "$output" != *"[dry-run] rm ${FAKE_HOME}/.claude/skills"* ]]
 }
 
+@test "--core --replace-stale-skills leaves a dangling skills symlink alone (35.2-019)" {
+    mkdir -p "${FAKE_HOME}/.claude"
+    ln -s "${FAKE_HOME}/gone/skills" "${FAKE_HOME}/.claude/skills"
+    _run_install --core --replace-stale-skills
+    [ "$status" -eq 0 ]
+    [ "$(readlink "${FAKE_HOME}/.claude/skills")" = "${FAKE_HOME}/gone/skills" ]
+    [ ! -e "${FAKE_HOME}/gone" ]
+    last="$(printf '%s\n' "$output" | tail -n 1)"
+    [[ "$last" == *"symlink to ${FAKE_HOME}/gone/skills"* ]]
+}
+
 @test "--help documents --replace-stale-skills (35.2-017)" {
     _run_install --help
     [[ "$output" == *"--replace-stale-skills"* ]]
