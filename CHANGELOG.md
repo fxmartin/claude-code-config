@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.129.0] - 2026-11-01
+
+### Added
+
+- feat(fleet-execution): a real skill directory that blocks (#35.2-017) (#956)
+
+
 ## [v2.128.0] - 2026-11-01
 
 ### Added
