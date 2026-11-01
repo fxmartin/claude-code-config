@@ -304,6 +304,31 @@ exit 1'
     [[ "$output" == *"done."* ]]
 }
 
+@test "a doctor with a FAIL among WARNs still exits 2 (Story 35.2-020)" {
+    stub sdlc '
+if [ "$1 $2" = "queue list" ]; then echo "{\"jobs\": []}"; exit 0; fi
+echo "[WARN] Run registry path — differs"
+echo "[FAIL] Fleet queue — unreachable"
+exit 2'
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"sdlc doctor was not CLEAN (exit 2)"* ]]
+}
+
+@test "a WARN exit with no parseable check line still exits 0, pointing above (Story 35.2-020)" {
+    stub sdlc '
+if [ "$1 $2" = "queue list" ]; then echo "{\"jobs\": []}"; exit 0; fi
+echo "something odd"
+exit 1'
+
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"sdlc doctor warned (exit 1)"*"see above"* ]]
+}
+
 # Story 35.2-018: on dev-server the unit was enabled twice while it could not run — once
 # with an `sdlc` that crashed on import, once with a queue that refused the box (403) —
 # and restart-looped. Neither is a FAIL only a running unit clears.
