@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.131.0] - 2026-11-01
+
+### Added
+
+- feat(fleet-execution): replacing stale skills never writes (#35.2-019) (#963)
+- feat(fleet-execution): a bootstrap that only has doctor (#35.2-020)
+
+
 ## [v2.130.0] - 2026-11-01
 
 ### Added
