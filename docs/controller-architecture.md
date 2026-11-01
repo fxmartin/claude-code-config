@@ -2498,7 +2498,17 @@ overrides — a worker that merges unscanned work has no safe degraded mode.
 Doctor runs *before* the unit: a worker that has not registered yet is a `FAIL`
 by design, so judging the bootstrap after step 7 would fail every first run. Its
 status is the script's exit status, returned once the unit is in place so a
-re-run can repair a worker that is down. Every step is idempotent: a second run
+re-run can repair a worker that is down. Two verdicts stop the run before any
+unit is installed, because the worker could only restart-loop (Story 35.2-018):
+a doctor that crashes — a Python traceback, such as an `sdlc` that cannot import,
+or an exit other than doctor's own 0/1/2 — prints the traceback's last line and
+exits non-zero, on a Mac too; and on Linux a `Fleet queue` FAIL with 403 while
+neither the shell nor `~/.config/sdlc/worker.env` holds an `SDLC_QUEUE_TOKEN`
+names that file (created empty, 0600) and how to fill it from the queue host
+(`plutil -extract EnvironmentVariables.SDLC_QUEUE_TOKEN raw
+~/Library/LaunchAgents/com.fxmartin.sdlc-queue.plist` on home-lab). Any other
+FAIL — the worker not registered yet — carries on as before: only the running
+unit clears it. Every step is idempotent: a second run
 adds no marketplace or plugin, reloads and restarts nothing, and leaves every
 file it writes byte-identical (`tests/fleet-bootstrap.bats`). `deploy.sh` does
 reinstall the controller each time (`uv tool install --force`), which is
