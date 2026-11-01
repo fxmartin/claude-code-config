@@ -28,6 +28,7 @@
 #   2. claude plugin marketplace add / install   the fx-claude-config marketplace
 #                                                and the autonomous-sdlc plugin
 #   3. scripts/deploy.sh                      plugin update + `sdlc` as a uv tool
+#                                                (+ --skip-sandbox-image when given)
 #   4. gh auth setup-git (+ glab's helper)    git authenticates through gh/glab, never a prompt
 #   5. ~/.sdlc-fleet.yaml                     queue_url: names the fleet queue
 #   6. `sdlc doctor --exit-code`              the verdict on steps 1-5 (skipping the checks
@@ -57,9 +58,11 @@
 # goes on: its credential helpers are declared there.
 #
 # Usage:
-#   scripts/fleet-bootstrap.sh --queue-url URL [--github-only] [--skip-service] [--dry-run]
+#   scripts/fleet-bootstrap.sh --queue-url URL [--github-only] [--skip-service]
+#       [--skip-sandbox-image] [--dry-run]
 #   scripts/fleet-bootstrap.sh --worker NAME --pool P [--pool P ...] [--host HOST] [--slots N] \
-#       --queue-url URL [--queue-service [--queue-allow LOGIN]] [--github-only] [--skip-service] [--dry-run]
+#       --queue-url URL [--queue-service [--queue-allow LOGIN]] [--github-only] [--skip-service]
+#       [--skip-sandbox-image] [--dry-run]
 #   scripts/fleet-bootstrap.sh --help
 #
 # --queue-url  the fleet queue's base URL (written to ~/.sdlc-fleet.yaml). Optional
@@ -72,6 +75,11 @@
 #              box without systemd --user), the LaunchAgents on a Mac — so it needs no
 #              tailnet address. Starting no worker, it is not refused for a missing
 #              glab or scanner.
+# --skip-sandbox-image  passed to deploy.sh: the box's podman cannot build the agent
+#              sandbox image — on Ubuntu, kernel.apparmor_restrict_unprivileged_userns = 1
+#              and a /nix/store podman outside every AppArmor profile (`sdlc doctor`'s
+#              sandbox-userns check says so). Without a pinned image the worker
+#              advertises no sandbox, so SDLC_SANDBOX=1 jobs go to other workers.
 # --dry-run    print what would run, and on a Mac the diff of every agent it would
 #              replace; change nothing.
 #
@@ -151,6 +159,7 @@ QUEUE_ALLOW=""
 DO_SERVICE=true
 DRY_RUN=false
 GITHUB_ONLY=false
+DEPLOY_ARGS=()
 
 usage() {
   # The header comment from line 5 to its end: no line number to keep in step with it.
@@ -176,6 +185,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)       DRY_RUN=true ;;
     --github-only)   GITHUB_ONLY=true ;;
     --skip-service)  DO_SERVICE=false ;;
+    --skip-sandbox-image) DEPLOY_ARGS+=(--skip-sandbox-image) ;;
     --queue-service) QUEUE_SERVICE=true ;;
     --worker)        [[ $# -ge 2 ]] || die "--worker needs a name"; WORKER_NAME="$2"; shift ;;
     --worker=*)      WORKER_NAME="${1#--worker=}" ;;
@@ -339,8 +349,8 @@ else
 fi
 
 # 3. Plugin pointer + the `sdlc` controller as a uv tool.
-log "scripts/deploy.sh"
-run "${DEPLOY_SH}"
+log "scripts/deploy.sh ${DEPLOY_ARGS[*]-}"
+run "${DEPLOY_SH}" ${DEPLOY_ARGS[@]+"${DEPLOY_ARGS[@]}"}
 
 # 4. git authenticates through each forge CLI's credential helper; with
 #    GIT_TERMINAL_PROMPT=0 (the unit sets it) a missing credential fails at once

@@ -357,6 +357,31 @@ EOF
     [ ! -e "${CONTROLLER_MARKER}" ]
 }
 
+@test "a failing build names --skip-sandbox-image on both scripts (Story 35.2-016)" {
+    printf '#!/usr/bin/env bash\nexit 1\n' >"${STUB_BIN}/fake-runtime"
+    printf '0\n' >"${TMP}/userns"
+    USERNS_SYSCTL="${TMP}/userns" _run_deploy
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"sandbox image build failed"* ]]
+    [[ "$output" == *"deploy.sh --skip-sandbox-image"* ]]
+    [[ "$output" == *"fleet-bootstrap.sh --skip-sandbox-image"* ]]
+    [[ "$output" != *"AppArmor"* ]]
+}
+
+@test "a failing build under restricted userns names the AppArmor sysctl and the runtime" {
+    printf '#!/usr/bin/env bash\nexit 1\n' >"${STUB_BIN}/fake-runtime"
+    printf '1\n' >"${TMP}/userns"
+    USERNS_SYSCTL="${TMP}/userns" _run_deploy
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"kernel.apparmor_restrict_unprivileged_userns = 1"* ]]
+    [[ "$output" == *"AppArmor profile"* ]]
+    [[ "$output" == *"${STUB_BIN}/fake-runtime"* ]]
+    [[ "$output" == *"deploy.sh --skip-sandbox-image"* ]]
+    [[ "$output" == *"fleet-bootstrap.sh --skip-sandbox-image"* ]]
+    [ ! -e "${PLUGIN_MARKER}" ]
+    [ ! -e "${CONTROLLER_MARKER}" ]
+}
+
 @test "--skip-sandbox-image skips the build and leaves the pin alone" {
     _run_deploy --skip-sandbox-image
     [ "$status" -eq 0 ]

@@ -73,6 +73,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SANDBOX_CONTAINERFILE="${SANDBOX_CONTAINERFILE:-${REPO_ROOT}/controller/sandbox/Containerfile}"
 SANDBOX_PIN_FILE="${SANDBOX_PIN_FILE:-${REPO_ROOT}/controller/src/sdlc/config/sandbox-image.yaml}"
 SANDBOX_TAG="sdlc-agent-sandbox:local"
+# Ubuntu's AppArmor gate on unprivileged user namespaces (Story 35.2-016); the
+# tests point USERNS_SYSCTL at a fixture so no run reads the real /proc.
+USERNS_SYSCTL="${USERNS_SYSCTL:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}"
 
 DO_CONTROLLER=true
 DO_PLUGIN=true
@@ -126,6 +129,25 @@ sandbox_runtime() {
   elif command -v docker >/dev/null 2>&1; then
     echo docker
   fi
+}
+
+# Why a sandbox image build failed, and how to deploy without it. Ubuntu lets only
+# binaries an AppArmor profile attaches to create unprivileged user namespaces, so
+# a podman outside /etc/apparmor.d (a /nix/store dev-shell one) fails `podman build`
+# with `failed to reexec: Permission denied` while `podman info` still works.
+sandbox_build_failed() {
+  local cause=""
+  if [[ "$(cat "${USERNS_SYSCTL}" 2>/dev/null)" == 1 ]]; then
+    cause="
+       kernel.apparmor_restrict_unprivileged_userns = 1: only a binary an AppArmor
+       profile attaches to may create the user namespace rootless ${RUNTIME} needs,
+       and $(command -v "${RUNTIME}" || echo "${RUNTIME}") may have none (a /nix/store
+       podman is outside /etc/apparmor.d/podman). Give it an AppArmor profile that
+       allows userns, or skip the image."
+  fi
+  die "sandbox image build failed; nothing else was changed.${cause}
+       To deploy without the image (SDLC_SANDBOX=1 jobs then go to other workers):
+       scripts/deploy.sh --skip-sandbox-image, or scripts/fleet-bootstrap.sh --skip-sandbox-image"
 }
 
 # Record `<arch>: sha256:<id>` in the pin file, replacing any existing line for
@@ -214,7 +236,7 @@ if [[ "${DO_SANDBOX}" == true ]]; then
     log "building sandbox image for ${ARCH} with ${RUNTIME}"
     "${RUNTIME}" build -t "${SANDBOX_TAG}" -f "${SANDBOX_CONTAINERFILE}" \
       "$(dirname "${SANDBOX_CONTAINERFILE}")" \
-      || die "sandbox image build failed; nothing else was changed"
+      || sandbox_build_failed
     IMAGE_ID="$("${RUNTIME}" image inspect --format '{{.Id}}' "${SANDBOX_TAG}")" \
       || die "could not read the sandbox image id"
     # podman prints the bare hex id, docker prefixes it with sha256:.

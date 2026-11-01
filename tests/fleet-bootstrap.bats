@@ -295,6 +295,22 @@ exit 0'
     ! grep -q systemctl "${CALLS}" || false
 }
 
+@test "--skip-sandbox-image is passed through to deploy.sh (Story 35.2-016)" {
+    run "${BOOTSTRAP}" --queue-url "${QUEUE}" --skip-sandbox-image
+
+    [ "$status" -eq 0 ]
+    grep -qx "deploy.sh --skip-sandbox-image" "${CALLS}"
+    # The worker is still bootstrapped: only the image is skipped.
+    grep -qx "systemctl --user enable --now sdlc-worker.service" "${CALLS}"
+}
+
+@test "--skip-sandbox-image is documented in --help" {
+    run "${BOOTSTRAP}" --help
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--skip-sandbox-image"* ]]
+}
+
 @test "--dry-run changes nothing" {
     run "${BOOTSTRAP}" --queue-url "${QUEUE}" --dry-run
 
