@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.127.2] - 2026-11-01
+
+### Fixed
+
+- fix(controller): keep the merge gate warn in the mypy baseline (#947)
+- fix(issue-host): report the github pr head sha to the merge gate (#947)
+- fix(contracts): accept null pr_number/pr_url in coverage response (#947)
+- fix(controller): fail closed on unreadable sha in merge re-gate (#947)
+
+
 ## [v2.127.1] - 2026-10-30
 
 ### Fixed
