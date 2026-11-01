@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.127.3] - 2026-11-01
+
+### Fixed
+
+- fix(fix-issue): push review bugfix before the re-review (#949) (#950)
+
+
 ## [v2.127.2] - 2026-11-01
 
 ### Fixed
