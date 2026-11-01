@@ -252,6 +252,22 @@ def _blocked_skills(claude_dir: Path) -> list[str]:
     )
 
 
+def _foreign_skills_symlink(claude_dir: Path) -> str | None:
+    """Target of a ~/.claude/skills symlink into anywhere but the install clone.
+
+    Such a link (e.g. into an older second clone) leaves every shipped skill
+    unlinked, and ``install.sh --core`` refuses to write through it (35.2-019).
+    The legacy directory-level link into the clone itself is not foreign.
+    """
+    skills_dst = claude_dir / "skills"
+    claude_md = claude_dir / "CLAUDE.md"
+    if not skills_dst.is_symlink() or not claude_md.is_symlink():
+        return None
+    if skills_dst.resolve() == (claude_md.resolve().parent / "skills").resolve():
+        return None
+    return os.readlink(skills_dst)
+
+
 def check_install(claude_dir: Path) -> Finding:
     """Verify the managed ~/.claude symlinks/files and the plugin marketplace."""
     if not claude_dir.exists():
@@ -285,6 +301,12 @@ def check_install(claude_dir: Path) -> Finding:
         warnings.append((
             f"stale marketplace install location {legacy} — Claude Code flags it as a corrupted installLocation",
             f"remove it: rm -rf {legacy}",
+        ))
+    skills_target = _foreign_skills_symlink(claude_dir)
+    if skills_target is not None:
+        warnings.append((
+            f"{claude_dir / 'skills'} is a symlink to {skills_target}, so no shipped skill is linked",
+            "replace the symlink with a real directory, keeping its synced/ folder, then re-run: ./install.sh --core",
         ))
     blocked = _blocked_skills(claude_dir)
     if blocked:

@@ -44,6 +44,8 @@ Options:
                 With --core, move a real ~/.claude/skills/<name> directory that
                 blocks a shipped skill's link into
                 ~/.claude/skills/.replaced-<timestamp>/ (never deleted), then link.
+                Refuses when ~/.claude/skills is itself a symlink to another
+                directory: nothing is moved or linked through it.
   --help        Show this help.
 
 Backward-compatible (deprecated, removed in next MAJOR):

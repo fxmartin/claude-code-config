@@ -26,6 +26,9 @@ _skill_entry_is_foreign() {
 # Shipped skills whose link a real ~/.claude/skills/<name> blocked this run,
 # space-separated; report_blocked_skills prints them last (35.2-017).
 BLOCKED_SKILLS=""
+# Target of a ~/.claude/skills symlink that points anywhere but this clone,
+# e.g. into an older second clone; set by link_skill_entries (35.2-019).
+SKILLS_SYMLINK_TARGET=""
 
 # Link each repo skill individually so ~/.claude/skills stays a real directory
 # that distro-, runtime- and user-provided skills can live in (#694).
@@ -37,9 +40,26 @@ link_skill_entries() {
   local replaced_dir replaced_made=false
   replaced_dir="$skills_dst/.replaced-$(date +%Y%m%d-%H%M%S)"
 
-  # Migrate a legacy directory-level symlink into the clone.
-  if [ -L "$skills_dst" ] && [ "$(readlink "$skills_dst")" = "$SCRIPT_DIR/skills" ]; then
-    run rm "$skills_dst"
+  if [ -L "$skills_dst" ]; then
+    if [ "$(readlink "$skills_dst")" = "$SCRIPT_DIR/skills" ]; then
+      # Migrate a legacy directory-level symlink into the clone.
+      run rm "$skills_dst"
+    else
+      # Anywhere else is another checkout's tree: its "stale" skills are that
+      # clone's tracked files, and moving or linking through the symlink would
+      # dirty it (35.2-019). Touch nothing beneath it; only record what it blocks.
+      SKILLS_SYMLINK_TARGET="$(readlink "$skills_dst")"
+      warn "Skipping skills: $skills_dst is a symlink to $SKILLS_SYMLINK_TARGET (nothing moved or linked beneath it)"
+      for entry in "$SCRIPT_DIR"/skills/*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name="$(basename "$entry")"
+        _skill_entry_is_foreign "$name" && continue
+        if [ -e "$skills_dst/$name" ] && [ ! -L "$skills_dst/$name" ]; then
+          BLOCKED_SKILLS="${BLOCKED_SKILLS:+$BLOCKED_SKILLS }$name"
+        fi
+      done
+      return 0
+    fi
   fi
   ensure_dir "$skills_dst"
 
@@ -68,8 +88,13 @@ link_skill_entries() {
 }
 
 # Final summary line naming every shipped skill a stale real directory still
-# shadows, so "Installation complete!" never hides them (35.2-017).
+# shadows, so "Installation complete!" never hides them (35.2-017) — or, when
+# ~/.claude/skills is a foreign symlink, the target they live behind (35.2-019).
 report_blocked_skills() {
+  if [ -n "$SKILLS_SYMLINK_TARGET" ]; then
+    warn "$CLAUDE_DIR/skills is a symlink to $SKILLS_SYMLINK_TARGET, so no shipped skill is linked${BLOCKED_SKILLS:+ (blocked behind it: ${BLOCKED_SKILLS// /, })} — replace the symlink with a real directory, keeping its synced/ folder, then re-run: ./install.sh --core"
+    return 0
+  fi
   [ -n "$BLOCKED_SKILLS" ] || return 0
   warn "Stale skill copies block their links (agents run the old copies): ${BLOCKED_SKILLS// /, } — replace them with: ./install.sh --core --replace-stale-skills"
 }

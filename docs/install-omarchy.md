@@ -142,6 +142,13 @@ with a warning naming it. `./install.sh --core --replace-stale-skills` moves
 each such directory to `~/.claude/skills/.replaced-<timestamp>/<name>` (never
 deleting it) and links the skill; foreign skills are never touched.
 
+If `~/.claude/skills` is itself a symlink to another directory (an older
+second clone, say), `--core` moves and links nothing beneath it, with or
+without `--replace-stale-skills`: those "stale" skills are that clone's tracked
+files. It ends with a warning naming the symlink's target. Replace the symlink
+with a real directory, keeping its `synced/` folder, then re-run
+`./install.sh --core`.
+
 `dev <dir>` opens a tmux session named after the directory with three windows:
 `claude` (runs `claude` when the directory is a git repo), `terminal`, and
 `yazi`. Switch windows with `prefix + n` / `prefix + p`; running `dev` again

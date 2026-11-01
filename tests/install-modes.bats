@@ -613,6 +613,50 @@ _run_install() {
     [ ! -e "${FAKE_HOME}/.claude/backups" ]
 }
 
+# A ~/.claude/skills symlink into another clone (35.2-019): its "stale" skills
+# are that clone's tracked files, so nothing may be moved or linked beneath it.
+_symlink_skills_to_other_clone() {
+    OTHER_SKILLS="${FAKE_HOME}/projects/other-clone/skills"
+    mkdir -p "$OTHER_SKILLS/telegram" "$OTHER_SKILLS/synced" "${FAKE_HOME}/.claude"
+    echo tracked > "$OTHER_SKILLS/telegram/SKILL.md"
+    ln -s "$OTHER_SKILLS" "${FAKE_HOME}/.claude/skills"
+}
+
+@test "--core --replace-stale-skills writes nothing behind a skills symlink (35.2-019)" {
+    _symlink_skills_to_other_clone
+    _run_install --core --replace-stale-skills
+    [ "$status" -eq 0 ]
+    [ "$(readlink "${FAKE_HOME}/.claude/skills")" = "$OTHER_SKILLS" ]
+    [ -d "$OTHER_SKILLS/telegram" ] && [ ! -L "$OTHER_SKILLS/telegram" ]
+    [ "$(cat "$OTHER_SKILLS/telegram/SKILL.md")" = "tracked" ]
+    [ -z "$(compgen -G "$OTHER_SKILLS/.replaced-*")" ]
+    [ -z "$(find "$OTHER_SKILLS" -type l)" ]
+    [[ "$output" != *"Moved stale skill"* ]]
+    last="$(printf '%s\n' "$output" | tail -n 1)"
+    [[ "$last" == *"⚠"* ]]
+    [[ "$last" == *"symlink to $OTHER_SKILLS"* ]]
+    [[ "$last" == *"synced/"* ]]
+}
+
+@test "--core names the skills symlink, not stale copies, in its summary (35.2-019)" {
+    _symlink_skills_to_other_clone
+    _run_install --core
+    [ "$status" -eq 0 ]
+    [ -z "$(find "$OTHER_SKILLS" -type l)" ]
+    last="$(printf '%s\n' "$output" | tail -n 1)"
+    [[ "$last" == *"symlink to $OTHER_SKILLS"* ]]
+    [[ "$last" == *"telegram"* ]]
+    [[ "$last" != *"Stale skill copies"* ]]
+}
+
+@test "--core --replace-stale-skills --dry-run previews nothing behind a skills symlink (35.2-019)" {
+    _symlink_skills_to_other_clone
+    _run_install --core --replace-stale-skills --dry-run
+    [ "$status" -eq 0 ]
+    [ -z "$(printf '%s\n' "$output" | grep -F "${FAKE_HOME}/.claude/skills/" | grep -F '[dry-run]')" ]
+    [[ "$output" != *"[dry-run] rm ${FAKE_HOME}/.claude/skills"* ]]
+}
+
 @test "--help documents --replace-stale-skills (35.2-017)" {
     _run_install --help
     [[ "$output" == *"--replace-stale-skills"* ]]
