@@ -1515,6 +1515,11 @@ it on the next real run).
     install clone ships blocks that skill's link, so agents run a stale copy
     (Story 35.2-017) → `WARN` naming the skills, remedy
     `./install.sh --core --replace-stale-skills`; foreign skills never count.
+    A `~/.claude/skills` that is itself a symlink to anywhere but the install
+    clone (e.g. an older second clone) leaves every shipped skill unlinked, and
+    `install.sh --core` refuses to write through it (Story 35.2-019) → `WARN`
+    naming the target, remedy: replace the symlink with a real directory,
+    keeping its `synced/` folder, then re-run `./install.sh --core`.
   - **Installed controller vs checkout** (Story 15.1-004) — compares
     `sdlc.__version__` (the PATH-installed `uv tool install` snapshot) against
     `[project].version` in the target repo's `controller/pyproject.toml` (the
