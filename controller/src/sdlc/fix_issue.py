@@ -57,7 +57,7 @@ from sdlc.build import (
     render_merge_drift_block,
     _registry_finish,
     _registry_register,
-    _local_branch_sha,
+    _pushed_head_sha,
     _push_bugfix_commit,
     _run_merge_ci_gate,
     _stage_succeeded,
@@ -2024,7 +2024,7 @@ def _run_stage_loop(
                         "parking NEEDS_ATTENTION; commits preserved on the branch",
                     )
                     return "NEEDS_ATTENTION", pr_number
-                pushed_bugfix_head = _local_branch_sha(
+                pushed_bugfix_head = _pushed_head_sha(
                     root or Path.cwd(), f"feature/{story.id}"
                 )
             attempt += 1

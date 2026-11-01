@@ -1326,6 +1326,13 @@ class GitHubAdapter(IssueHostAdapter):
         ).stdout
         return _github_rollup_status(_parse_json_object(out).get("statusCheckRollup"))
 
+    def cr_head_pipeline_sha(self, ref: "str | ChangeRequest") -> str | None:
+        # Issue #947: the check rollup belongs to the PR head commit, so its sha
+        # is the head's; without it the fail-closed gate times out on every push.
+        out = self._run("pr", "view", _cr_ref_of(ref), "--json", "headRefOid").stdout
+        sha = _parse_json_object(out).get("headRefOid")
+        return str(sha) if sha else None
+
     def cr_checks(self, ref: "str | ChangeRequest") -> ChangeRequestChecks:
         out = self._run(
             "pr", "view", _cr_ref_of(ref), "--json", "labels,statusCheckRollup"

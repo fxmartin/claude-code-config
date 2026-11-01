@@ -1610,6 +1610,13 @@ def _stub_cr_status(monkeypatch, statuses: list[str | None]) -> list[int]:
         return statuses[min(len(calls) - 1, len(statuses) - 1)]
 
     monkeypatch.setattr(build_issue_mod, "change_request_status", _status)
+    # Issue #947: the gate fails closed on an unreadable pushed/pipeline sha, so
+    # these tmp_path (non-git) runs need a consistent, readable sha on both sides.
+    import sdlc.build as build_mod
+    import sdlc.fix_issue as fix_mod
+
+    monkeypatch.setattr(fix_mod, "_pushed_head_sha", lambda root, branch: "pushed")
+    monkeypatch.setattr(build_mod, "_ci_head_sha_lookup", lambda *a, **k: "pushed")
     return calls
 
 
@@ -5315,7 +5322,13 @@ def test_fix_merge_bugfix_is_pushed_before_the_regate(tmp_path, monkeypatch) -> 
 
     monkeypatch.setattr(fix_mod, "_run_merge_ci_gate", _gate)
     monkeypatch.setattr(fix_mod, "_push_bugfix_commit", _push)
-    monkeypatch.setattr(fix_mod, "_local_branch_sha", lambda root, branch: "abc123")
+    monkeypatch.setattr(fix_mod, "_pushed_head_sha", lambda root, branch: "abc123")
+    # Issue #947: the host reports the old head's pipeline for the first polls
+    # after the push, then the pushed head's — the gate must wait, not re-fail.
+    import sdlc.build as build_mod
+
+    shas = iter(["old", "old", "abc123"])
+    monkeypatch.setattr(build_mod, "_ci_head_sha_lookup", lambda *a, **k: next(shas, "abc123"))
     result = _run_gated_fix(tmp_path, RecordingDispatcher())
     assert result.status == "DONE"
     assert order[:3] == ["gate:None", "push", "gate:abc123"]

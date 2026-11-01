@@ -43,6 +43,12 @@ def _statuses(monkeypatch, statuses: list[str]) -> list[int]:
         return statuses[min(len(calls) - 1, len(statuses) - 1)]
 
     monkeypatch.setattr(build_issue, "change_request_status", _status)
+    # Issue #947: the gate fails closed on an unreadable pushed/pipeline sha;
+    # these non-git runs need a consistent readable sha on both sides.
+    import sdlc.build as build_mod
+
+    monkeypatch.setattr(build_mod, "_pushed_head_sha", lambda root, branch: "pushed")
+    monkeypatch.setattr(build_mod, "_ci_head_sha_lookup", lambda *a, **k: "pushed")
     return calls
 
 
