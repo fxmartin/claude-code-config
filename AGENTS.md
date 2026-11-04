@@ -170,6 +170,21 @@ flow still runs there.
 Starting a project, mirror operations, credential rotation, and post-reboot
 recovery of the appliance: `~/.claude/reference-docs/source-control.md`.
 
+## Shared memory
+
+The `memory` MCP server is FX's memory, shared with Claude Code and the other agents.
+
+- Before answering a question about FX's infrastructure, projects or earlier decisions, call
+  `search` with `namespace` set to the repository name and `include_global` true.
+- When a decision is made, call `add` straight away with type `decision`: the choice and the
+  reason for it.
+- When FX states something durable about their infrastructure, projects or setup, call `add`
+  with type `fact`.
+- When FX corrects how you behave, call `add` with type `preference`: what to do instead.
+- Set `namespace` to the repository name for anything specific to this project; omit it for what
+  is true everywhere.
+- Never store a secret, token or password in a memory.
+
 ## Reference Materials
 - Claude source guidance: `~/.claude/CLAUDE.md`
 - Source control reference: `~/.claude/reference-docs/source-control.md`
