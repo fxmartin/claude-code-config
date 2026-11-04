@@ -222,6 +222,22 @@ fix(hooks)!: drop unused stdin in permission hooks
 BREAKING CHANGE: the permission hook no longer reads stdin for the log subcommand.
 ```
 
+## Shared memory
+
+The `memory` MCP server is FX's memory, shared with Codex, Claude.ai, ChatGPT, Hermes and Claude Desktop.
+
+- Before answering a question about FX's infrastructure, projects or earlier decisions, call
+  `search` with `namespace` set to the repository name and `include_global` true.
+- When a decision is made, call `add` straight away with type `decision`: the choice and the
+  reason for it.
+- When FX states something durable about their infrastructure, projects or setup, call `add`
+  with type `fact`.
+- When FX corrects how you behave, call `add` with type `preference`: what to do instead.
+- Set `namespace` to the repository name for anything specific to this project; omit it for what
+  is true everywhere. The repository name is the main checkout's directory in lowercase, so a
+  worktree gives the repository's name; in a directory that is not a git repository, omit it.
+- Never store a secret, token or password in a memory.
+
 ## Reference Materials
 - **CLAUDE.md guide**: `docs/claude-md-guide.md` — structure, guardrails, maintenance, and how this file itself is organized
 - **Python**: `docs/python-best-practices.md`
