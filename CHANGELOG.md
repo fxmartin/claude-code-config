@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.134.0] - 2026-11-04
+
+### Added
+
+- feat(memory): shared-memory instructions for codex (#967)
+
+
 ## [v2.133.0] - 2026-11-04
 
 ### Added
