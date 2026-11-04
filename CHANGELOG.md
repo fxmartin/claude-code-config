@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.132.0] - 2026-11-04
+
+### Added
+
+- feat(memory): shared-memory instructions for claude code (#965)
+
+
 ## [v2.131.0] - 2026-11-01
 
 ### Added
