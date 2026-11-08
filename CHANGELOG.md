@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.135.0] - 2026-11-08
+
+### Added
+
+- feat(install): link per-host workspace instructions into the work dir
+- feat(install): link the skills omarchy ships into ~/.claude/skills
+
+### Fixed
+
+- fix(doctor): foreign skills by name are synced and dot-entries only
+
+
 ## [v2.134.0] - 2026-11-04
 
 ### Added
