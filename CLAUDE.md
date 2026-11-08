@@ -18,6 +18,18 @@
 - ALWAYS ask for clarification rather than making assumptions.
 - If you're having trouble with something, it's ok to stop and ask for help. Especially if it's something your human might be better at.
 
+## Operating Rules (FX, 2026-11-08)
+- **Config changes go to GitLab before and after.** Before editing anything in a
+  config repo (`~/Work/claude-code-config` first of all), commit and push the
+  current state to the `gitlab` remote; after the edit, commit and push again.
+  Never leave a config change uncommitted or unpushed.
+- **Tell FX before any command that needs root.** Say what the command is and
+  why `sudo` is required, then wait for the go-ahead. Prefer the non-root
+  alternative when one exists.
+- **Never print passwords or tokens.** Not in output, logs, commit messages,
+  memories or summaries. Redact them from command output (`.credentials.json`,
+  `settings.json` env blocks, `.env`, keyring and `op` output).
+
 ## Machines
 
 This config is shared across machines via symlinks, so never assume a platform.
@@ -26,13 +38,27 @@ Check with `uname -s` (`Darwin` / `Linux`) before reaching for a platform tool.
 | Host | Hardware | OS | Managed by |
 |------|----------|----|------------|
 | `macbook-pro-m3-max` | MacBook Pro M3 Max | macOS | `nix-install` (nix-darwin) |
-| `omarchy-xps13` *(in setup)* | Dell XPS 13 9350 | Omarchy 4 "Quattro" — Arch Linux, Hyprland/Wayland, Foot, bash 5 | `omarchy-install` |
+| `omarchy-xps13` | Dell XPS 13 9350 — Core Ultra 7 258V, 32 GiB, 1 TB NVMe | Omarchy 4.5.0 — Arch Linux, Hyprland 0.56 (Lua config), Foot, bash 5; full profile in `machines/omarchy-xps13/CLAUDE.md`, loaded from `~/Work` on that host | `omarchy-install` |
 | `home-lab` | MacBook Pro M1 Pro (`MacBookPro18,3`) | macOS | `nix-install` (nix-darwin) |
 
 `home-lab` hosts the **local-ci-cd** GitLab stack the CI Compatibility section
 below assumes. Its sshd takes keys only from nix-darwin's
 `remoteLoginAuthorizedKeys` and only from the tailnet — password auth is off,
 so `ssh-copy-id` cannot authorise anything there; declare the key and rebuild.
+
+**Project roots** (decided 2026-11-08; full catalogue in
+`~/.claude/reference-docs/projects.md`):
+
+- `~/projects/<name>` holds the human checkouts on every host. `home-lab` has
+  none; it is the appliance.
+- `~/Work/<name>` is the SDLC fleet worker's clone root on every host. Worker
+  clones are reset on dispatch, never hand-edit them. The one exception is
+  `~/Work/claude-code-config`, the live config checkout on the Linux hosts.
+- On the Macs the live config is `~/.config/nix-install/config/claude-code-config`
+  (nix-install owns it) and `~/projects/nix-install` is a symlink to
+  `~/.config/nix-install`.
+- On `macbook-pro-m3-max`, `~/dev` is a transitional symlink to `~/projects`.
+  Create nothing new under it.
 
 On Omarchy, prefer what the distro already ships over hand-rolling an equivalent:
 
@@ -131,7 +157,7 @@ The following tools are installed and SHOULD be used via Bash when the built-in 
 | `find` | `fd` | Faster, respects `.gitignore`, sane defaults. E.g. `fd '\.py$'` instead of `find . -name '*.py'` |
 | `grep` / `rg` (via Bash) | `rg` (ripgrep) | Already installed — use when Grep tool can't cover the need (e.g. complex piped workflows) |
 | `cat` (for reading) | `bat` | Syntax highlighting, line numbers, git integration. E.g. `bat src/main.ts` |
-| `cd` (manual navigation) | `zoxide` (`z`) | Jump to frecent directories. E.g. `z myproject` instead of `cd ~/dev/long/path/myproject` |
+| `cd` (manual navigation) | `zoxide` (`z`) | Jump to frecent directories. E.g. `z myproject` instead of `cd ~/projects/long/path/myproject` |
 | Interactive file selection | `fzf` | Pipe any list into `fzf` for interactive filtering. E.g. `fd '\.ts$' \| fzf` |
 | `ls -la` for file browsing | `yazi` (`y`) | Full terminal file manager with previews. Available as `y` shell function |
 | `jq` for JSON | `jq` | Installed — use for JSON processing in shell pipelines |
@@ -245,6 +271,7 @@ The `memory` MCP server is FX's memory, shared with Codex, Claude.ai, ChatGPT, H
 - **Containers**: `docs/container-best-practices.md`
 - **Testing & TDD**: `docs/testing-best-practices.md`
 - **Source Control**: `@~/.claude/reference-docs/source-control.md` — see also the **Commit Format** section above
+- **Projects**: `~/.claude/reference-docs/projects.md` — where every repo lives per host and what the pillar repos do
 - **Full Workflow**: `WORKFLOW-v2.md`
 
 ---

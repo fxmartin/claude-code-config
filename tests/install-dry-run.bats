@@ -74,7 +74,9 @@ _snapshot() {
     # are committed relative symlinks inside commands/, carried in by the commands
     # directory symlink, so they are not linked separately (doing so would rewrite
     # them as absolute and dirty the repo).
-    ln_lines="$(printf '%s\n' "$output" | grep '\[dry-run\] ln -s' | grep -vc '/\.claude/skills/')"
+    # Skill links and the per-host machines/<host>/CLAUDE.md link depend on the
+    # host (Omarchy tree present, ~/Work present), so both are left out.
+    ln_lines="$(printf '%s\n' "$output" | grep '\[dry-run\] ln -s' | grep -v '/\.claude/skills/' | grep -vc '/Work/CLAUDE\.md')"
     [ "$ln_lines" -eq 14 ]
 }
 

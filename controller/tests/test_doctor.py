@@ -398,7 +398,10 @@ def test_install_skills_symlink_into_own_clone_is_not_foreign(tmp_path: Path) ->
 def test_foreign_skill_names_match_install_core_sh() -> None:
     """doctor's foreign-skill list must mirror install/core.sh's (35.2-017)."""
     core_sh = (Path(__file__).resolve().parents[2] / "install" / "core.sh").read_text(encoding="utf-8")
-    match = re.search(r"_skill_entry_is_foreign\(\) \{\n  case \"\$1\" in\n    ([^)]+)\)", core_sh)
+    match = re.search(
+        r"_skill_entry_is_foreign\(\) \{\n  local name=\"\$1\".*\n  case \"\$name\" in\n    ([^)]+)\)",
+        core_sh,
+    )
     assert match is not None, "install/core.sh must define _skill_entry_is_foreign"
     names = set(match.group(1).split("|")) - {".*"}
     assert names == set(FOREIGN_SKILL_NAMES)

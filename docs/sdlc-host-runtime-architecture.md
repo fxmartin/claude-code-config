@@ -119,7 +119,7 @@ shipped projects under other names.
 |---|---|---|
 | SDLC control plane | `claude-code-config` repo + `autonomous-sdlc` plugin + external `sdlc` controller | `sdlc` v2.45.12 at `~/.local/bin/sdlc`: `build`, `fix`, `resume`, `status`, `doctor`, `runs`, `dashboard`, `state`, `rollback`, `reconcile`, ledger, SAST/depscan gates |
 | Host configuration | `nix-install` (nix-darwin, `~/Documents/nix-install`) | v2.36.0; pins `claude-code-config` as a submodule; manages Tailscale, cmux, oMLX, maintenance and health services; profile-gated (`power` = Mac Studio class) |
-| Container isolation | `isolated-dev` (`~/dev/isolated-dev`) | Epic 01 complete (13 stories); Go CLI over Apple `container machine`: `up/open/run/status/stop/upgrade/destroy`, versioned base image, `.isolated-dev.toml` |
+| Container isolation | `isolated-dev` (`~/projects/isolated-dev`) | Epic 01 complete (13 stories); Go CLI over Apple `container machine`: `up/open/run/status/stop/upgrade/destroy`, versioned base image, `.isolated-dev.toml` |
 | Isolation substrate | Apple `container` CLI | 1.1.0, services running |
 | Local inference | oMLX | Installed and pinned by `nix-install/darwin/omlx.nix`; menubar app (see §7) |
 | Remote transport | Tailscale, Mosh, Blink | Tailscale via managed cask; `mosh-server` via nix |
