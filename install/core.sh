@@ -139,6 +139,39 @@ unlink_distro_skills() {
   done
 }
 
+# Per-machine workspace instructions: machines/<host>/CLAUDE.md, when the
+# repo has one for this host, is linked to $WORK_DIR/CLAUDE.md so sessions
+# started in the fleet worker's clone root load it on top of the global file.
+# No-op on a host without such a directory or without a Work dir.
+# CLAUDE_MACHINE_NAME overrides the hostname (tests); CLAUDE_WORK_DIR the root.
+machine_name() {
+  printf '%s' "${CLAUDE_MACHINE_NAME:-$(hostname -s 2>/dev/null || hostname)}"
+}
+
+machine_claude_md() {
+  printf '%s/machines/%s/CLAUDE.md' "$SCRIPT_DIR" "$(machine_name)"
+}
+
+work_dir() {
+  printf '%s' "${CLAUDE_WORK_DIR:-$HOME/Work}"
+}
+
+link_machine_claude_md() {
+  local src dst
+  src="$(machine_claude_md)"
+  [ -f "$src" ] || return 0
+  dst="$(work_dir)/CLAUDE.md"
+  if [ ! -d "$(work_dir)" ]; then
+    warn "Skipping machine CLAUDE.md: $(work_dir) does not exist"
+    return 0
+  fi
+  create_symlink "$src" "$dst"
+}
+
+unlink_machine_claude_md() {
+  remove_symlink "$(work_dir)/CLAUDE.md" "$(machine_claude_md)"
+}
+
 # Final summary line naming every shipped skill a stale real directory still
 # shadows, so "Installation complete!" never hides them (35.2-017) — or, when
 # ~/.claude/skills is a foreign symlink, the target they live behind (35.2-019).
@@ -255,6 +288,7 @@ install_core_run() {
   create_symlink "$SCRIPT_DIR/docs"                    "$CLAUDE_DIR/docs"
   link_skill_entries
   link_distro_skills
+  link_machine_claude_md
   create_symlink "$SCRIPT_DIR/hooks"                   "$CLAUDE_DIR/hooks"
 
   # Codex reads its global instructions from ~/.codex/AGENTS.md — the Codex
@@ -329,6 +363,7 @@ install_core_uninstall() {
   remove_symlink "$CLAUDE_DIR/keybindings.json"        "$SCRIPT_DIR/keybindings.json"
   remove_symlink "$CLAUDE_DIR/reference-docs"          "$SCRIPT_DIR/reference-docs"
   remove_symlink "$CLAUDE_DIR/docs"                    "$SCRIPT_DIR/docs"
+  unlink_machine_claude_md
   unlink_distro_skills
   unlink_skill_entries
   remove_symlink "$CLAUDE_DIR/hooks"                   "$SCRIPT_DIR/hooks"

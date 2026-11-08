@@ -594,6 +594,66 @@ _run_install_omarchy() {
     [ -L "${FAKE_HOME}/.claude/skills/omarchy" ]
 }
 
+# machines/<host>/CLAUDE.md → $HOME/Work/CLAUDE.md. CLAUDE_MACHINE_NAME stands in
+# for the hostname; machines/omarchy-xps13 is the one directory the repo ships.
+_run_install_machine() {
+    local name="$1"; shift
+    run env HOME="${FAKE_HOME}" CLAUDE_MACHINE_NAME="$name" CLAUDE_CONFIG_NO_ENV=1 bash "${INSTALL}" "$@"
+}
+
+@test "--core links machines/<host>/CLAUDE.md into ~/Work when both exist" {
+    mkdir -p "${FAKE_HOME}/Work"
+    _run_install_machine omarchy-xps13 --core
+    [ "$status" -eq 0 ]
+    [ "$(readlink "${FAKE_HOME}/Work/CLAUDE.md")" = "$(cd "${BATS_TEST_DIRNAME}/.." && pwd)/machines/omarchy-xps13/CLAUDE.md" ]
+    [ ! -e "${FAKE_HOME}/.claude/backups" ]
+    _run_install_machine omarchy-xps13 --core
+    [ "$status" -eq 0 ]
+    [ ! -e "${FAKE_HOME}/.claude/backups" ]
+}
+
+@test "--core links no machine CLAUDE.md for a host the repo has no directory for" {
+    mkdir -p "${FAKE_HOME}/Work"
+    _run_install_machine no-such-host --core
+    [ "$status" -eq 0 ]
+    [ ! -e "${FAKE_HOME}/Work/CLAUDE.md" ]
+    [ ! -L "${FAKE_HOME}/Work/CLAUDE.md" ]
+}
+
+@test "--core skips the machine CLAUDE.md when ~/Work does not exist" {
+    _run_install_machine omarchy-xps13 --core
+    [ "$status" -eq 0 ]
+    [ ! -e "${FAKE_HOME}/Work" ]
+    [[ "$output" == *"Skipping machine CLAUDE.md"* ]]
+}
+
+@test "--core --dry-run previews the machine CLAUDE.md link and creates nothing" {
+    mkdir -p "${FAKE_HOME}/Work"
+    _run_install_machine omarchy-xps13 --core --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[dry-run] ln -s"*"/Work/CLAUDE.md"* ]]
+    [ ! -e "${FAKE_HOME}/Work/CLAUDE.md" ]
+}
+
+@test "--uninstall removes the machine CLAUDE.md link it created" {
+    mkdir -p "${FAKE_HOME}/Work"
+    _run_install_machine omarchy-xps13 --core
+    [ "$status" -eq 0 ]
+    [ -L "${FAKE_HOME}/Work/CLAUDE.md" ]
+    _run_install_machine omarchy-xps13 --uninstall
+    [ "$status" -eq 0 ]
+    [ ! -L "${FAKE_HOME}/Work/CLAUDE.md" ]
+    [ -d "${FAKE_HOME}/Work" ]
+}
+
+@test "--uninstall leaves a hand-written ~/Work/CLAUDE.md alone" {
+    mkdir -p "${FAKE_HOME}/Work"
+    echo "hand written" > "${FAKE_HOME}/Work/CLAUDE.md"
+    _run_install_machine omarchy-xps13 --uninstall
+    [ "$status" -eq 0 ]
+    [ "$(cat "${FAKE_HOME}/Work/CLAUDE.md")" = "hand written" ]
+}
+
 @test "--uninstall removes the Codex AGENTS.md link" {
     _run_install --core
     [ "$status" -eq 0 ]

@@ -26,7 +26,7 @@ Check with `uname -s` (`Darwin` / `Linux`) before reaching for a platform tool.
 | Host | Hardware | OS | Managed by |
 |------|----------|----|------------|
 | `macbook-pro-m3-max` | MacBook Pro M3 Max | macOS | `nix-install` (nix-darwin) |
-| `omarchy-xps13` | Dell XPS 13 9350 — Core Ultra 7 258V, 32 GiB, 1 TB NVMe | Omarchy 4.5.0 — Arch Linux, Hyprland 0.56 (Lua config), Foot, bash 5; full profile in CLAUDE.md § "omarchy-xps13 — Machine Profile" | `omarchy-install` |
+| `omarchy-xps13` | Dell XPS 13 9350 — Core Ultra 7 258V, 32 GiB, 1 TB NVMe | Omarchy 4.5.0 — Arch Linux, Hyprland 0.56 (Lua config), Foot, bash 5; full profile in `machines/omarchy-xps13/CLAUDE.md`, loaded from `~/Work` on that host | `omarchy-install` |
 | `home-lab` | MacBook Pro M1 Pro (`MacBookPro18,3`) | macOS | `nix-install` (nix-darwin) |
 
 `home-lab` hosts the **local-ci-cd** GitLab stack the CI Compatibility section
