@@ -91,11 +91,13 @@ MANAGED_PATHS: tuple[str, ...] = (
     "hooks",
 )
 
-# Entries of the clone's skills/ that are runtime/distro leftovers, not skills
-# the repo ships, along with any dot-entry (#694). Keep in sync with
-# install/core.sh's _skill_entry_is_foreign;
+# Entries of the clone's skills/ that are runtime leftovers, not skills the
+# repo ships, along with any dot-entry (#694). Keep in sync with the name
+# branch of install/core.sh's _skill_entry_is_foreign;
 # test_foreign_skill_names_match_install_core_sh asserts they never diverge.
-FOREIGN_SKILL_NAMES: tuple[str, ...] = ("synced", "omarchy", "diagnose-crash")
+# The Omarchy-shipped skills are no longer foreign by name: link_distro_skills
+# owns them, and core.sh recognises pre-4.5 leftover links by their target.
+FOREIGN_SKILL_NAMES: tuple[str, ...] = ("synced",)
 
 # The plugin marketplace is not a managed path: since #743/#800 `install.sh
 # --core` registers it as a `directory` source in settings.json and removes the
