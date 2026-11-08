@@ -26,6 +26,8 @@
   `claude-code-config` accepts pull requests only, so after the GitLab push
   open a PR from a sync branch, wait for CI and merge it; a change to any
   `*.sh` file also needs the `risk-approved` label, which FX adds by hand.
+  A `feat` or `fix` merge makes the release workflow add a `chore(release)`
+  commit on GitHub `main`; fast-forward `gitlab/main` to it afterwards.
 - **Tell FX before any command that needs root.** Say what the command is and
   why `sudo` is required, then wait for the go-ahead. Prefer the non-root
   alternative when one exists.
