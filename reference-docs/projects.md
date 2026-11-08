@@ -83,13 +83,13 @@ claude-code-source-code-leak (m3max, both upstreams disabled).
 
 ## Known leftovers after the 2026-11-08 alignment
 
-- `macbook-pro-m3-max`: `~/projects/claude-code-config` (92 branches, 3
-  stashes) and `~/projects/ai-research/claude-code-config` (15 branches) are
-  stale copies of the config repo. Review the stashes and the branches whose
-  tips are on no remote, then delete them; the live copy is under
-  `~/.config/nix-install`.
-- `macbook-pro-m3-max`: `music-library` (origin now `cellar`) has diverged from
-  its remote, `forge`, `personal-assistant`, `local-ai-menubar-app`, `llmbench`
-  and `archivist` carry unpushed commits. Local work only; nothing was pushed.
-- nix-install docs and the omarchy-install README still name `~/dev/<repo>` or
-  `~/Work/omarchy-monitoring` as dev checkouts; fix them in their own repos.
+- `macbook-pro-m3-max`: forge, personal-assistant, music-library (origin now
+  `cellar`), local-ai-menubar-app and local-ci-cd (`feature/issue-247`) hold
+  feature branches whose remote counterpart moved on, so a plain push is
+  rejected as non-fast-forward. They need a rebase or a local delete, FX's
+  call; nothing was forced. Sixteen repos there also have uncommitted changes.
+- Upstream fixes in flight: omarchy-install MR !6 and nix-install PR #781
+  rename the last `~/dev` and `~/Work/omarchy-monitoring` references;
+  claude-code-config PR #969 brings GitHub `main` level with GitLab.
+- `local-ci-cd/tests/stack/reconcile.test.ts` uses `/Users/fxmartin/dev/...`
+  as fixture strings only; left alone.
