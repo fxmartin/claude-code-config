@@ -61,9 +61,11 @@ oMLX/`qwen` harness, `/demo` narration) are unavailable on Omarchy by design.
 
 ## omarchy-xps13 — Machine Profile
 
-Surveyed 2026-11-08 without root. Refresh with `inxi -Fxxxz --no-sudo`,
-`hyprctl monitors`, `hyprctl devices`, `lsusb -t`, `boltctl list`,
-`bluetoothctl devices Connected`, `pacman -Qe`.
+Surveyed 2026-11-08 without root. Refresh with `omarchy-debug --no-sudo --print`
+(call the binary directly: on 4.5.0 the `omarchy debug` dispatcher rejects the
+flags the shipped skill prescribes), `inxi -Fxxxz --no-sudo`, `hyprctl monitors`,
+`hyprctl devices`, `lsusb -t`, `boltctl list`, `bluetoothctl devices Connected`,
+`pacman -Qe`.
 
 **Identity and firmware**
 - Dell XPS 13 9350, board `0MMW13` rev A01, SKU `0CC9`. BIOS 1.24.1
@@ -78,7 +80,8 @@ Surveyed 2026-11-08 without root. Refresh with `inxi -Fxxxz --no-sudo`,
 - CPU: Intel Core Ultra 7 258V (Lunar Lake), 4 P-cores up to 4.8 GHz + 4 E-cores
   up to 3.7 GHz, 8 threads (no SMT), VT-x. L2 14 MiB, L3 12 MiB. Governor
   `intel_pstate` powersave / `balance_power`; `power-profiles-daemon` on
-  `balanced`; `thermald` and `intel_lpmd` running.
+  `balanced`; `thermald` and `intel_lpmd` running. Microcode 0x128; every
+  listed CPU vulnerability is mitigated or not affected.
 - RAM: 32 GiB LPDDR5X on the CPU package, not upgradable. Per-module detail
   needs root (`dmidecode -t 17`).
 - GPU: Intel Arc 140V (Xe2, kernel driver `xe`, Mesa Vulkan 1.4), integrated
@@ -93,8 +96,9 @@ Surveyed 2026-11-08 without root. Refresh with `inxi -Fxxxz --no-sudo`,
   btrfs, subvolume `@` on `/` plus `/home`, `/var/log`, `/var/cache/pacman/pkg`.
   ~217 GiB used of 952 GiB. Snapper snapshots synced to Limine
   (`limine-snapper-sync`); `snapper list` needs root.
-- Swap: 31 GiB zram (priority 100) + 31 GiB `/swap/swapfile` (priority 0) with
-  `resume=` on the kernel cmdline, so hibernate to the swapfile is configured.
+- Swap: 31 GiB zram (zstd, priority 100) + 31 GiB `/swap/swapfile` (priority 0)
+  with `resume=` on the kernel cmdline, so hibernate to the swapfile is
+  configured; hibernate image ~12 GiB. Swappiness 150, cache-pressure 50.
   Suspend is s2idle.
 
 **Display, audio, camera, input**
@@ -159,11 +163,21 @@ Surveyed 2026-11-08 without root. Refresh with `inxi -Fxxxz --no-sudo`,
   are symlinks into `~/Work/claude-code-config`. `~/.claude/settings.json` is a
   per-machine real file. A second copy of the repo exists at
   `~/projects/claude-code-config` (created 2026-11-08 and copied back to
-  `~/Work` the same day); `~/Work` is the live checkout. Other agent homes:
-  `~/.codex`, `~/.config/Codex`, `~/.config/opencode`, `~/.gemini`, `~/.hermes`.
+  `~/Work` the same day, then deleted); `~/Work` is the only checkout. Other
+  agent homes: `~/.codex`, `~/.config/Codex`, `~/.config/opencode`, `~/.gemini`,
+  `~/.hermes`.
+- Omarchy ships three agent skills in `/usr/share/omarchy/default/agents/skills`:
+  `omarchy` (desktop and `~/.config` customisation, required for any such
+  edit), `omarchy-app` (Qt app scaffold) and `diagnose-crash` (coredumps). Codex
+  gets all three via `~/.agents/skills`. For Claude, `omarchy-app` was linked on
+  2026-11-06 and `omarchy` + `diagnose-crash` were linked by hand into
+  `~/.claude/skills` on 2026-11-08, because `install/core.sh` deliberately
+  skips those two names (#694). The installer leaves foreign links alone, so
+  they survive `./install.sh --core`.
 
 **Installed software** (pacman: 1294 packages, 236 explicit, 1 AUR
-`cellar-hifi`; no Flatpak)
+`cellar-hifi`; no Flatpak; repos are Omarchy stable only, `pkgs.omarchy.org`
+and `stable-mirror.omarchy.org`)
 - Omarchy apps: hype, monologue, omacut, omawrite, omasnap, omacalc, owe +
   owe-lockfeed, signed, tobi-try, gliff, cliamp, herdr, omarchy-settings,
   omarchy-hyprland-titlebars, quickshell.
@@ -193,6 +207,9 @@ Surveyed 2026-11-08 without root. Refresh with `inxi -Fxxxz --no-sudo`,
   bluetooth, bolt, cups, avahi, sshd, nordvpnd, proton VPN, thermald,
   intel_lpmd, power-profiles-daemon, upower, udisks2, sddm, systemd-resolved,
   systemd-oomd.
+
+**Observed this boot**: the journal shows `sshd` failing to start six times
+early in the boot before it came up (it is active now); nothing else recurring.
 
 **Needs root on this machine (ask first)**: `dmidecode`, `smartctl` /
 `nvme smart-log`, `snapper list`, `fwupdmgr refresh`, the Docker socket,
