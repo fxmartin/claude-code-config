@@ -35,7 +35,7 @@ This plugin name and prefix match the Codex `autonomous-sdlc` plugin (`~/Documen
 
 ## Installation
 
-The marketplace lives at the root of the parent repo (`~/dev/claude-code-config/.claude-plugin/marketplace.json`). After running `install.sh`, register and install with:
+The marketplace lives at the root of the parent repo (`~/Work/claude-code-config/.claude-plugin/marketplace.json`). After running `install.sh`, register and install with:
 
 ```
 /plugin marketplace add fx-claude-config

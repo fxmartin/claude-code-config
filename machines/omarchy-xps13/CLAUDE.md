@@ -14,6 +14,8 @@ Edit it in the repo and push to GitLab before and after, like any config.
 - `claude-code-config/` is the live config checkout. The `~/.claude` symlinks
   (CLAUDE.md, agents, commands, hooks, docs, keybindings, reference-docs,
   statusline) and the per-skill links under `~/.claude/skills` point into it.
+- Human checkouts live in `~/projects/<name>`, not here (27 repos at the
+  2026-11-08 survey). `~/Work` holds only this config checkout and worker clones.
 
 ## Maintaining the laptop from here
 

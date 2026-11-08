@@ -46,6 +46,20 @@ below assumes. Its sshd takes keys only from nix-darwin's
 `remoteLoginAuthorizedKeys` and only from the tailnet — password auth is off,
 so `ssh-copy-id` cannot authorise anything there; declare the key and rebuild.
 
+**Project roots** (decided 2026-11-08; full catalogue in
+`~/.claude/reference-docs/projects.md`):
+
+- `~/projects/<name>` holds the human checkouts on every host. `home-lab` has
+  none; it is the appliance.
+- `~/Work/<name>` is the SDLC fleet worker's clone root on every host. Worker
+  clones are reset on dispatch, never hand-edit them. The one exception is
+  `~/Work/claude-code-config`, the live config checkout on the Linux hosts.
+- On the Macs the live config is `~/.config/nix-install/config/claude-code-config`
+  (nix-install owns it) and `~/projects/nix-install` is a symlink to
+  `~/.config/nix-install`.
+- On `macbook-pro-m3-max`, `~/dev` is a transitional symlink to `~/projects`.
+  Create nothing new under it.
+
 On Omarchy, prefer what the distro already ships over hand-rolling an equivalent:
 
 - `omarchy` — the top-level CLI (`omarchy update`, `omarchy bar put <plugin> --section right`).
@@ -143,7 +157,7 @@ The following tools are installed and SHOULD be used via Bash when the built-in 
 | `find` | `fd` | Faster, respects `.gitignore`, sane defaults. E.g. `fd '\.py$'` instead of `find . -name '*.py'` |
 | `grep` / `rg` (via Bash) | `rg` (ripgrep) | Already installed — use when Grep tool can't cover the need (e.g. complex piped workflows) |
 | `cat` (for reading) | `bat` | Syntax highlighting, line numbers, git integration. E.g. `bat src/main.ts` |
-| `cd` (manual navigation) | `zoxide` (`z`) | Jump to frecent directories. E.g. `z myproject` instead of `cd ~/dev/long/path/myproject` |
+| `cd` (manual navigation) | `zoxide` (`z`) | Jump to frecent directories. E.g. `z myproject` instead of `cd ~/projects/long/path/myproject` |
 | Interactive file selection | `fzf` | Pipe any list into `fzf` for interactive filtering. E.g. `fd '\.ts$' \| fzf` |
 | `ls -la` for file browsing | `yazi` (`y`) | Full terminal file manager with previews. Available as `y` shell function |
 | `jq` for JSON | `jq` | Installed — use for JSON processing in shell pipelines |
@@ -257,6 +271,7 @@ The `memory` MCP server is FX's memory, shared with Codex, Claude.ai, ChatGPT, H
 - **Containers**: `docs/container-best-practices.md`
 - **Testing & TDD**: `docs/testing-best-practices.md`
 - **Source Control**: `@~/.claude/reference-docs/source-control.md` — see also the **Commit Format** section above
+- **Projects**: `~/.claude/reference-docs/projects.md` — where every repo lives per host and what the pillar repos do
 - **Full Workflow**: `WORKFLOW-v2.md`
 
 ---

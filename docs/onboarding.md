@@ -69,8 +69,8 @@ Restart Claude Code (or run `/plugin reload` if your build supports it). The sla
 ### Install path B — local clone + `install.sh`
 
 ```bash
-git clone git@github.com:fxmartin/claude-code-config.git ~/dev/claude-code-config
-cd ~/dev/claude-code-config
+git clone git@github.com:fxmartin/claude-code-config.git ~/Work/claude-code-config
+cd ~/Work/claude-code-config
 cp .env.example .env          # machine-specific values (BROWSER_PATH, optional Telegram creds)
 ./install.sh --core           # symlinks only; conservative default
 ```
@@ -138,7 +138,7 @@ Then invoke `/brainstorm` in a throwaway repo and confirm it reaches the first i
 If you cloned the repo, you have a fully automated smoke test:
 
 ```bash
-cd ~/dev/claude-code-config
+cd ~/Work/claude-code-config
 bash scripts/smoke-test.sh
 ```
 

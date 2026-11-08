@@ -43,7 +43,7 @@ Target: under 15 minutes of reading.
 
 ### 2. One `/build-stories` run on a fresh test repo
 
-Create a brand-new throwaway repo (literally a fresh `~/dev/pilot-test/` or
+Create a brand-new throwaway repo (literally a fresh `~/projects/pilot-test/` or
 similar — don't run the pilot on a repo you care about). Pick any
 single-sentence project idea ("a CLI that converts CSV to JSON", "a markdown
 linter that flags trailing whitespace", whatever).

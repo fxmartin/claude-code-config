@@ -122,9 +122,9 @@ Clone into your WSL2 home directory, **not** onto the Windows filesystem
 degradation and occasional git lock-file issues.
 
 ```bash
-mkdir -p ~/dev
-git clone git@github.com:fxmartin/claude-code-config.git ~/dev/claude-code-config
-cd ~/dev/claude-code-config
+mkdir -p ~/Work
+git clone git@github.com:fxmartin/claude-code-config.git ~/Work/claude-code-config
+cd ~/Work/claude-code-config
 ```
 
 If you do not yet have an SSH key in your WSL2 home, generate one first:
@@ -240,7 +240,7 @@ Install the **Remote - WSL** extension on the Windows side:
 Then, from inside the WSL2 Ubuntu shell:
 
 ```bash
-cd ~/dev/claude-code-config
+cd ~/Work/claude-code-config
 code .
 ```
 
@@ -257,7 +257,7 @@ After running `./install.sh --core`, confirm the install worked:
 # Symlinks should exist
 ls -la ~/.claude/
 
-# Expected entries (symlinks pointing into ~/dev/claude-code-config/):
+# Expected entries (symlinks pointing into ~/Work/claude-code-config/):
 # CLAUDE.md -> ...
 # agents/ -> ...
 # commands/ -> ...

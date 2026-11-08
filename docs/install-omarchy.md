@@ -91,9 +91,9 @@ gh auth status         # expect: Logged in to github.com as <yourname>
 ## Step 5 — Clone the repo
 
 ```bash
-mkdir -p ~/dev
-git clone git@github.com:fxmartin/claude-code-config.git ~/dev/claude-code-config
-cd ~/dev/claude-code-config
+mkdir -p ~/Work
+git clone git@github.com:fxmartin/claude-code-config.git ~/Work/claude-code-config
+cd ~/Work/claude-code-config
 ```
 
 Optional machine-specific settings:
@@ -183,8 +183,8 @@ Then inside a Claude Code session:
 bash scripts/smoke-test.sh          # expect: SMOKE_TEST: 4/4 passed
 bats tests/install-platform-arch.bats
 command -v sqlite3 uuidgen jq tmux yazi
-ls -la ~/.claude/CLAUDE.md          # → symlink into ~/dev/claude-code-config
-dev ~/dev/claude-code-config        # tmux: claude | terminal | yazi
+ls -la ~/.claude/CLAUDE.md          # → symlink into ~/Work/claude-code-config
+dev ~/Work/claude-code-config        # tmux: claude | terminal | yazi
 ```
 
 Start `claude` inside the repo: the SessionStart hook should print the
