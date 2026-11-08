@@ -34,6 +34,20 @@ below assumes. Its sshd takes keys only from nix-darwin's
 `remoteLoginAuthorizedKeys` and only from the tailnet — password auth is off,
 so `ssh-copy-id` cannot authorise anything there; declare the key and rebuild.
 
+**Project roots** (decided 2026-11-08; full catalogue in
+`~/.claude/reference-docs/projects.md`):
+
+- `~/projects/<name>` holds the human checkouts on every host. `home-lab` has
+  none; it is the appliance.
+- `~/Work/<name>` is the SDLC fleet worker's clone root on every host. Worker
+  clones are reset on dispatch, never hand-edit them. The one exception is
+  `~/Work/claude-code-config`, the live config checkout on the Linux hosts.
+- On the Macs the live config is `~/.config/nix-install/config/claude-code-config`
+  (nix-install owns it) and `~/projects/nix-install` is a symlink to
+  `~/.config/nix-install`.
+- On `macbook-pro-m3-max`, `~/dev` is a transitional symlink to `~/projects`.
+  Create nothing new under it.
+
 On Omarchy, prefer what the distro already ships over hand-rolling an equivalent:
 
 - `omarchy` — the top-level CLI (`omarchy update`, `omarchy bar put <plugin> --section right`).
