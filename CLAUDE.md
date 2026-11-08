@@ -38,7 +38,7 @@ Check with `uname -s` (`Darwin` / `Linux`) before reaching for a platform tool.
 | Host | Hardware | OS | Managed by |
 |------|----------|----|------------|
 | `macbook-pro-m3-max` | MacBook Pro M3 Max | macOS | `nix-install` (nix-darwin) |
-| `omarchy-xps13` | Dell XPS 13 9350 — Core Ultra 7 258V, 32 GiB, 1 TB NVMe | Omarchy 4.5.0 — Arch Linux, Hyprland 0.56 (Lua config), Foot, bash 5; profile below | `omarchy-install` |
+| `omarchy-xps13` | Dell XPS 13 9350 — Core Ultra 7 258V, 32 GiB, 1 TB NVMe | Omarchy 4.5.0 — Arch Linux, Hyprland 0.56 (Lua config), Foot, bash 5; full profile in CLAUDE.md § "omarchy-xps13 — Machine Profile" | `omarchy-install` |
 | `home-lab` | MacBook Pro M1 Pro (`MacBookPro18,3`) | macOS | `nix-install` (nix-darwin) |
 
 `home-lab` hosts the **local-ci-cd** GitLab stack the CI Compatibility section
@@ -169,11 +169,10 @@ flags the shipped skill prescribes), `inxi -Fxxxz --no-sudo`, `hyprctl monitors`
 - Omarchy ships three agent skills in `/usr/share/omarchy/default/agents/skills`:
   `omarchy` (desktop and `~/.config` customisation, required for any such
   edit), `omarchy-app` (Qt app scaffold) and `diagnose-crash` (coredumps). Codex
-  gets all three via `~/.agents/skills`. For Claude, `omarchy-app` was linked on
-  2026-11-06 and `omarchy` + `diagnose-crash` were linked by hand into
-  `~/.claude/skills` on 2026-11-08, because `install/core.sh` deliberately
-  skips those two names (#694). The installer leaves foreign links alone, so
-  they survive `./install.sh --core`.
+  gets all three via `~/.agents/skills`. Since 2026-11-08 `./install.sh --core`
+  links all three into `~/.claude/skills` as well (`link_distro_skills` in
+  `install/core.sh`; the old #694 name-based exclusion of `omarchy` and
+  `diagnose-crash` is gone). `--uninstall` removes only those links.
 
 **Installed software** (pacman: 1294 packages, 236 explicit, 1 AUR
 `cellar-hifi`; no Flatpak; repos are Omarchy stable only, `pkgs.omarchy.org`

@@ -28,6 +28,8 @@ teardown() {
     # primary-root marker (#630/#642) — remove it so tests never leave the
     # working tree dirty.
     rm -f "${BATS_TEST_DIRNAME}/../.sdlc-primary-root"
+    # The leftover-link test plants an untracked symlink in the clone's skills/.
+    rm -f "${BATS_TEST_DIRNAME}/../skills/zz-leftover-test"
     # Likewise --core seeds the gitignored settings.json (#693); drop it only
     # if this test created it.
     [ -n "${SEEDED_SETTINGS:-}" ] && rm -f "${BATS_TEST_DIRNAME}/../settings.json"
@@ -469,7 +471,10 @@ _run_install() {
     [ "$(readlink "$sk/foreign-link")" = "${FAKE_HOME}/elsewhere/other" ]
     for d in "${BATS_TEST_DIRNAME}"/../skills/*/; do
         n="$(basename "$d")"
-        case "$n" in synced|omarchy|diagnose-crash) continue ;; esac
+        case "$n" in synced) continue ;; esac
+        # A symlink in the clone's skills/ is a pre-4.5 leftover into the
+        # Omarchy tree, owned by link_distro_skills, not a repo skill.
+        [ -L "${d%/}" ] && continue
         [ -L "$sk/$n" ]
     done
     # Nothing was moved to the backup dir, and the clone is not written into.
@@ -498,6 +503,95 @@ _run_install() {
     [ "$status" -eq 0 ]
     [ -d "${FAKE_HOME}/.claude/skills/foreign-real" ]
     [ ! -L "${FAKE_HOME}/.claude/skills/telegram" ]
+}
+
+# Omarchy ships its agent skills under $OMARCHY_PATH/default/agents/skills.
+# --core links them like repo skills; OMARCHY_PATH points the tests at a fake
+# tree so they run the same on a Mac runner and on an Omarchy laptop.
+_make_fake_omarchy() {
+    FAKE_OMARCHY="${FAKE_HOME}/omarchy-tree"
+    local s
+    for s in omarchy omarchy-app diagnose-crash; do
+        mkdir -p "$FAKE_OMARCHY/default/agents/skills/$s"
+        echo "# $s" > "$FAKE_OMARCHY/default/agents/skills/$s/SKILL.md"
+    done
+}
+
+_run_install_omarchy() {
+    run env HOME="${FAKE_HOME}" OMARCHY_PATH="${FAKE_OMARCHY}" CLAUDE_CONFIG_NO_ENV=1 bash "${INSTALL}" "$@"
+}
+
+@test "--core links the Omarchy-shipped skills from OMARCHY_PATH" {
+    _make_fake_omarchy
+    _run_install_omarchy --core
+    [ "$status" -eq 0 ]
+    local s
+    for s in omarchy omarchy-app diagnose-crash; do
+        [ "$(readlink "${FAKE_HOME}/.claude/skills/$s")" = "$FAKE_OMARCHY/default/agents/skills/$s" ]
+    done
+    [ ! -e "${FAKE_HOME}/.claude/backups" ]
+    # Re-run is a no-op.
+    _run_install_omarchy --core
+    [ "$status" -eq 0 ]
+    [ ! -e "${FAKE_HOME}/.claude/backups" ]
+}
+
+@test "--core links no Omarchy skills where no Omarchy tree exists" {
+    FAKE_OMARCHY="${FAKE_HOME}/no-such-tree"
+    _run_install_omarchy --core
+    [ "$status" -eq 0 ]
+    [ ! -e "${FAKE_HOME}/.claude/skills/omarchy" ]
+    [ ! -L "${FAKE_HOME}/.claude/skills/omarchy" ]
+    [[ "$output" != *"Omarchy skill"* ]]
+}
+
+@test "--core leaves a real directory in an Omarchy skill's place alone" {
+    _make_fake_omarchy
+    mkdir -p "${FAKE_HOME}/.claude/skills/omarchy"
+    echo "mine" > "${FAKE_HOME}/.claude/skills/omarchy/SKILL.md"
+    _run_install_omarchy --core
+    [ "$status" -eq 0 ]
+    [ -d "${FAKE_HOME}/.claude/skills/omarchy" ] && [ ! -L "${FAKE_HOME}/.claude/skills/omarchy" ]
+    [ "$(cat "${FAKE_HOME}/.claude/skills/omarchy/SKILL.md")" = "mine" ]
+    [[ "$output" == *"Skipping Omarchy skill omarchy"* ]]
+    [ -L "${FAKE_HOME}/.claude/skills/diagnose-crash" ]
+    [ ! -e "${FAKE_HOME}/.claude/backups" ]
+}
+
+@test "--core --dry-run previews Omarchy skill links and creates nothing" {
+    _make_fake_omarchy
+    _run_install_omarchy --core --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[dry-run] ln -s"*"/.claude/skills/omarchy"* ]]
+    [[ "$output" == *"[dry-run] ln -s"*"/.claude/skills/diagnose-crash"* ]]
+    [ ! -e "${FAKE_HOME}/.claude" ]
+}
+
+@test "--uninstall removes the Omarchy skill links it created and keeps foreign skills" {
+    _make_fake_omarchy
+    mkdir -p "${FAKE_HOME}/.claude/skills/foreign-real"
+    _run_install_omarchy --core
+    [ "$status" -eq 0 ]
+    [ -L "${FAKE_HOME}/.claude/skills/omarchy" ]
+    _run_install_omarchy --uninstall
+    [ "$status" -eq 0 ]
+    [ ! -L "${FAKE_HOME}/.claude/skills/omarchy" ]
+    [ ! -L "${FAKE_HOME}/.claude/skills/diagnose-crash" ]
+    [ ! -L "${FAKE_HOME}/.claude/skills/omarchy-app" ]
+    [ -d "${FAKE_HOME}/.claude/skills/foreign-real" ]
+}
+
+@test "--core skips a clone-side leftover link into the Omarchy tree (#694)" {
+    _make_fake_omarchy
+    # Pre-4.5 installs dropped symlinks to the shipped skills into the clone's
+    # skills/ dir. They must not be re-linked under their leftover name.
+    ln -s "$FAKE_OMARCHY/default/agents/skills/omarchy" "${BATS_TEST_DIRNAME}/../skills/zz-leftover-test"
+    _run_install_omarchy --core
+    rm -f "${BATS_TEST_DIRNAME}/../skills/zz-leftover-test"
+    [ "$status" -eq 0 ]
+    [ ! -e "${FAKE_HOME}/.claude/skills/zz-leftover-test" ]
+    [ ! -L "${FAKE_HOME}/.claude/skills/zz-leftover-test" ]
+    [ -L "${FAKE_HOME}/.claude/skills/omarchy" ]
 }
 
 @test "--uninstall removes the Codex AGENTS.md link" {

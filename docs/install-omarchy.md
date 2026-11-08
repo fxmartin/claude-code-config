@@ -124,17 +124,20 @@ What each mode does on Arch:
 
 | Mode | Effect |
 |------|--------|
-| `--core` | Symlinks `CLAUDE.md`, `agents/`, `commands/`, `hooks/`, `settings.json`, … into `~/.claude/`, and `AGENTS.md` into `~/.codex/` for Codex. Each repo skill is linked individually into `~/.claude/skills/`, which stays a real directory |
+| `--core` | Symlinks `CLAUDE.md`, `agents/`, `commands/`, `hooks/`, `settings.json`, … into `~/.claude/`, and `AGENTS.md` into `~/.codex/` for Codex. Each repo skill, and each skill Omarchy ships under `/usr/share/omarchy/default/agents/skills/`, is linked individually into `~/.claude/skills/`, which stays a real directory |
 | `--tools` | `sudo pacman -S --needed --noconfirm yazi bat fd ripgrep fzf zoxide ffmpeg imagemagick poppler 7zip jq ttf-nerd-fonts-symbols tmux` (packages Omarchy already ships are skipped) |
 | `--mcp` | Merges the Playwright + context7 MCP servers into `~/.claude.json` |
 | `--shell` | Appends `dev()` and `y()` to `~/.bashrc` (or `~/.zshrc` if zsh is your `$SHELL`) |
 
 `settings.json` is gitignored, so on first run `--core` seeds it from `settings.template.json` (never overwriting an existing one). The template enables auto permission mode (`permissions.defaultMode: "auto"`, `skipAutoPermissionPrompt: true`), which changes agent behaviour on the machine.
 
-Omarchy ships its own Claude skills (`omarchy`, `diagnose-crash`) as symlinks in
-`~/.claude/skills/`, and Claude Code keeps account-synced skills in `synced/`.
-`--core` preserves all of them: it only adds this repo's skills alongside, and
-`--uninstall` removes only the links it created.
+Omarchy ships its agent skills (`omarchy`, `omarchy-app`, `diagnose-crash`)
+under `/usr/share/omarchy/default/agents/skills/`. `--core` links each of them
+into `~/.claude/skills/` next to this repo's skills, so Claude Code gets the
+same set Codex already reads from `~/.agents/skills/`; set `OMARCHY_PATH` to
+link from another tree. Where no such tree exists the step does nothing.
+Claude Code's account-synced `synced/` folder and any other skill you added by
+hand are left alone, and `--uninstall` removes only the links it created.
 
 A real directory where one of this repo's skills should be linked (an old copy
 from before skills were linked individually) is left alone, and `--core` ends

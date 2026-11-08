@@ -14,12 +14,29 @@
 # asserts the two never diverge.
 SDLC_PRIMARY_ROOT_MARKER=".sdlc-primary-root"
 
-# Entries in $SCRIPT_DIR/skills that are runtime/distro leftovers, not repo
-# skills (#694). Never linked back into ~/.claude/skills.
+# Omarchy ships its agent skills (omarchy, omarchy-app, diagnose-crash) under
+# $OMARCHY_PATH/default/agents/skills; link_distro_skills links them into
+# ~/.claude/skills on a machine that has that tree. OMARCHY_PATH is Omarchy's
+# own variable (set in its sessions, /usr/share/omarchy otherwise); tests point
+# it at a fake tree.
+omarchy_skills_dir() {
+  printf '%s/default/agents/skills' "${OMARCHY_PATH:-/usr/share/omarchy}"
+}
+
+# Entries in $SCRIPT_DIR/skills that are not repo skills and are never linked
+# back into ~/.claude/skills (#694): dotfiles, Claude Code's account-synced
+# folder, and pre-4.5 leftover symlinks into the Omarchy tree (matched by
+# target, not by name — link_distro_skills owns those skills now).
 _skill_entry_is_foreign() {
-  case "$1" in
-    .*|synced|omarchy|diagnose-crash) return 0 ;;
+  local name="$1" entry="${2:-}"
+  case "$name" in
+    .*|synced) return 0 ;;
   esac
+  if [ -n "$entry" ] && [ -L "$entry" ]; then
+    case "$(readlink "$entry")" in
+      "$(omarchy_skills_dir)"/*) return 0 ;;
+    esac
+  fi
   return 1
 }
 
@@ -53,7 +70,7 @@ link_skill_entries() {
       for entry in "$SCRIPT_DIR"/skills/*; do
         [ -e "$entry" ] || [ -L "$entry" ] || continue
         name="$(basename "$entry")"
-        _skill_entry_is_foreign "$name" && continue
+        _skill_entry_is_foreign "$name" "$entry" && continue
         if [ -e "$skills_dst/$name" ] && [ ! -L "$skills_dst/$name" ]; then
           BLOCKED_SKILLS="${BLOCKED_SKILLS:+$BLOCKED_SKILLS }$name"
         fi
@@ -66,7 +83,7 @@ link_skill_entries() {
   for entry in "$SCRIPT_DIR"/skills/*; do
     [ -e "$entry" ] || [ -L "$entry" ] || continue
     name="$(basename "$entry")"
-    _skill_entry_is_foreign "$name" && continue
+    _skill_entry_is_foreign "$name" "$entry" && continue
     if [ -e "$skills_dst/$name" ] && [ ! -L "$skills_dst/$name" ]; then
       if [ "${REPLACE_STALE_SKILLS:-false}" = "true" ]; then
         $replaced_made || ensure_dir "$replaced_dir"
@@ -84,6 +101,41 @@ link_skill_entries() {
       continue
     fi
     create_symlink "$entry" "$skills_dst/$name"
+  done
+}
+
+# Link every skill Omarchy ships into ~/.claude/skills, the same way
+# link_skill_entries links repo skills. A no-op where the Omarchy tree is
+# absent (macOS, CI) or where ~/.claude/skills is a foreign symlink (35.2-019).
+# A real directory in a shipped skill's place is left alone and reported; it
+# is not a stale repo copy, so --replace-stale-skills does not move it.
+link_distro_skills() {
+  local src_dir skills_dst="$CLAUDE_DIR/skills" entry name
+  src_dir="$(omarchy_skills_dir)"
+  [ -d "$src_dir" ] || return 0
+  [ -z "$SKILLS_SYMLINK_TARGET" ] || return 0
+  ensure_dir "$skills_dst"
+
+  for entry in "$src_dir"/*; do
+    [ -d "$entry" ] || continue
+    name="$(basename "$entry")"
+    if [ -e "$skills_dst/$name" ] && [ ! -L "$skills_dst/$name" ]; then
+      warn "Skipping Omarchy skill $name: a real ${skills_dst}/$name already exists (left untouched)"
+      continue
+    fi
+    create_symlink "$entry" "$skills_dst/$name"
+  done
+}
+
+# Remove only the links link_distro_skills created (by exact target).
+unlink_distro_skills() {
+  local src_dir skills_dst="$CLAUDE_DIR/skills" entry
+  src_dir="$(omarchy_skills_dir)"
+  [ -d "$src_dir" ] || return 0
+  [ -d "$skills_dst" ] && [ ! -L "$skills_dst" ] || return 0
+  for entry in "$src_dir"/*; do
+    [ -d "$entry" ] || continue
+    remove_symlink "$skills_dst/$(basename "$entry")" "$entry"
   done
 }
 
@@ -202,6 +254,7 @@ install_core_run() {
   create_symlink "$SCRIPT_DIR/reference-docs"          "$CLAUDE_DIR/reference-docs"
   create_symlink "$SCRIPT_DIR/docs"                    "$CLAUDE_DIR/docs"
   link_skill_entries
+  link_distro_skills
   create_symlink "$SCRIPT_DIR/hooks"                   "$CLAUDE_DIR/hooks"
 
   # Codex reads its global instructions from ~/.codex/AGENTS.md — the Codex
@@ -276,6 +329,7 @@ install_core_uninstall() {
   remove_symlink "$CLAUDE_DIR/keybindings.json"        "$SCRIPT_DIR/keybindings.json"
   remove_symlink "$CLAUDE_DIR/reference-docs"          "$SCRIPT_DIR/reference-docs"
   remove_symlink "$CLAUDE_DIR/docs"                    "$SCRIPT_DIR/docs"
+  unlink_distro_skills
   unlink_skill_entries
   remove_symlink "$CLAUDE_DIR/hooks"                   "$SCRIPT_DIR/hooks"
   remove_symlink "$CODEX_DIR/AGENTS.md"                "$SCRIPT_DIR/AGENTS.md"
