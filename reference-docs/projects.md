@@ -88,7 +88,8 @@ claude-code-source-code-leak (m3max, both upstreams disabled).
   squash merge (`[gone]` in `git branch -vv`) remain in forge, music-library,
   local-ci-cd, llmbench, archivist and nix-install; they hold nothing
   unmerged and can be pruned at leisure.
-- Upstream fixes: omarchy-install MR !6 merged 2026-11-08; nix-install PR #781
-  and claude-code-config PR #969 (GitHub `main` level with GitLab) are open.
+- Upstream fixes: omarchy-install MR !6, nix-install PR #781 and
+  claude-code-config PR #969 (GitHub `main` level with GitLab) all merged
+  2026-11-08.
 - `local-ci-cd/tests/stack/reconcile.test.ts` uses `/Users/fxmartin/dev/...`
   as fixture strings only; left alone.
