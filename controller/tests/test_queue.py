@@ -963,3 +963,17 @@ def test_restart_fresh_clears_the_run_and_keeps_the_scope(tmp_path) -> None:
     job = store.get_job(job_id)
     assert (job.state, job.run_id, job.claimed_by, job.lease_until) == ("queued", None, None, None)
     assert (job.kind, job.scope) == ("fix", "614")
+
+
+def test_cancel_dismisses_a_failed_job_and_keeps_its_reason(tmp_path) -> None:
+    from sdlc.queue import QueueStore
+
+    store = QueueStore(tmp_path / "queue.db")
+    store.init()
+    job_id = store.add_job(repo="/repo", kind="build", scope="epic-1")
+    store.claim_next(claimed_by="w1", lease_seconds=60)
+    store.finish_job(job_id, "failed", reason="build_failed: quality gate")
+    store.cancel_job(job_id)
+    job = store.get_job(job_id)
+    assert (job.state, job.reason) == ("cancelled", "build_failed: quality gate")
+    assert store.claim_next(claimed_by="w1", lease_seconds=60) is None
