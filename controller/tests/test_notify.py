@@ -830,3 +830,57 @@ def test_configured_host_logs_nothing(monkeypatch):
     sent, sender = _collector()
     notify_mod.notify("run_started", sender=sender)
     assert sent and not notify_mod._LOG_FILE.exists()
+
+
+def test_op_timeout_falls_back_on_a_non_numeric_value(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_OP_TIMEOUT", "soon")
+    assert notify_mod._op_timeout() == notify_mod._DEFAULT_OP_TIMEOUT_S
+
+
+def test_op_read_is_none_when_op_cannot_be_spawned(monkeypatch):
+    monkeypatch.undo()
+
+    def boom(*args, **kwargs):
+        raise OSError("exec format error")
+
+    monkeypatch.setattr(notify_mod.shutil, "which", lambda name: "/bin/op")
+    monkeypatch.setattr(notify_mod.subprocess, "Popen", boom)
+    assert notify_mod._op_read("op://x") is None
+
+
+def test_op_read_tolerates_a_process_group_already_gone(monkeypatch, tmp_path):
+    monkeypatch.undo()
+    _fake_op_on_path(monkeypatch, tmp_path, "sleep 30")
+    monkeypatch.setenv("TELEGRAM_OP_TIMEOUT", "1")
+
+    def gone(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(notify_mod.os, "killpg", gone)
+    real_popen = notify_mod.subprocess.Popen
+    procs = []
+
+    def tracking_popen(*args, **kwargs):
+        procs.append(real_popen(*args, **kwargs))
+        return procs[-1]
+
+    monkeypatch.setattr(notify_mod.subprocess, "Popen", tracking_popen)
+    import threading
+
+    try:
+        # The second communicate() blocks until op exits; kill it from a timer.
+        timer = threading.Timer(2.0, lambda: [p.kill() for p in procs])
+        timer.start()
+        assert notify_mod._op_read("op://x") is None
+    finally:
+        timer.cancel()
+        for p in procs:
+            p.kill()
+
+
+def test_unconfigured_log_failure_never_raises(monkeypatch, tmp_path):
+    _clear_creds(monkeypatch)
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    monkeypatch.setattr(notify_mod, "_LOG_FILE", blocker / "sub" / "n.log")
+    notify_mod.log_unconfigured()  # parent is a file -> OSError, swallowed
