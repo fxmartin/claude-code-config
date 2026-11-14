@@ -184,3 +184,55 @@ stop() { jq -nc --arg t "$1" '{hook_event_name:"Stop",session_id:"s1",transcript
     jq -e '[.hooks.Stop[].hooks[].command] | any(endswith("worktree-gc.sh"))' "$work/settings.json"
     rm -rf "$work"
 }
+
+@test "unknown hook event sends nothing" {
+    run_hook '{"hook_event_name":"SessionStart","session_id":"s1"}'
+    [ "$status" -eq 0 ]
+    [ "$(sent_count)" -eq 0 ]
+}
+
+@test "Stop without transcript_path sends nothing" {
+    run_hook '{"hook_event_name":"Stop","session_id":"s1"}'
+    [ "$status" -eq 0 ]
+    [ "$(sent_count)" -eq 0 ]
+}
+
+@test "non-numeric CLAUDE_NOTIFY_MIN_TURN_SECONDS falls back to 120s" {
+    run_hook "$(stop "$(transcript_with_prompt 10)")" CLAUDE_NOTIFY_MIN_TURN_SECONDS=abc
+    [ "$(sent_count)" -eq 0 ]
+    run_hook "$(stop "$(transcript_with_prompt 300)")" CLAUDE_NOTIFY_MIN_TURN_SECONDS=abc
+    [ "$(sent_count)" -eq 1 ]
+}
+
+@test "Notification without message still pings with host only" {
+    run_hook '{"hook_event_name":"Notification","session_id":"s1"}'
+    [ "$(sent_count)" -eq 1 ]
+    grep -q '^Waiting for you|' "$SENT"
+}
+
+@test "tmux session name is included when TMUX is set" {
+    command -v tmux >/dev/null 2>&1 || skip "tmux not installed"
+    mkdir -p "$FAKE_HOME/bin"
+    printf '#!/bin/sh\necho mysess\n' > "$FAKE_HOME/bin/tmux"
+    chmod +x "$FAKE_HOME/bin/tmux"
+    run_hook "$(notif hi)" TMUX=/tmp/x,1,0 PATH="$FAKE_HOME/bin:$PATH"
+    grep -q 'tmux mysess' "$SENT"
+}
+
+@test "installer merge: no settings.json is a no-op" {
+    work="$(mktemp -d)"
+    run bash -c "SCRIPT_DIR='$work'; info(){ :; }; warn(){ :; }; $(sed -n '/^register_session_notify_hook()/,/^}/p' "$REPO_ROOT/install/core.sh"); register_session_notify_hook"
+    [ "$status" -eq 0 ]
+    [ ! -e "$work/settings.json" ]
+    rm -rf "$work"
+}
+
+@test "installer merge: dry-run leaves settings.json untouched" {
+    work="$(mktemp -d)"
+    echo '{"hooks":{}}' > "$work/settings.json"
+    run bash -c "SCRIPT_DIR='$work'; DRY_RUN=true; info(){ :; }; warn(){ :; }; $(sed -n '/^register_session_notify_hook()/,/^}/p' "$REPO_ROOT/install/core.sh"); register_session_notify_hook"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *dry-run* ]]
+    [ "$(cat "$work/settings.json")" = '{"hooks":{}}' ]
+    rm -rf "$work"
+}
