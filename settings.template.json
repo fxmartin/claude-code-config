@@ -46,6 +46,11 @@
           {
             "type": "command",
             "command": "~/.claude/hooks/worktree-gc.sh"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/notify-session-event.sh",
+            "timeout": 10
           }
         ]
       }
@@ -58,6 +63,17 @@
             "type": "command",
             "command": "~/.claude/hooks/on-pr-merge-docs.sh",
             "if": "Bash(gh pr merge *)"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/notify-session-event.sh",
+            "timeout": 10
           }
         ]
       }
