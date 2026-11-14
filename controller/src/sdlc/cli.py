@@ -1537,6 +1537,10 @@ def runs(
     prune: bool = typer.Option(
         False, "--prune", help="Remove crashed (dead-pid) entries before listing."
     ),
+    finished: bool = typer.Option(
+        False, "--finished",
+        help="With --prune, also remove finished (FAILED/ABORTED/DONE) entries.",
+    ),
     active: bool = typer.Option(
         False, "--active",
         help="List only live, unfinished runs, one per line; nothing when none is.",
@@ -1547,16 +1551,19 @@ def runs(
     The registry is a discovery cache written by each ``sdlc build`` (default
     ``~/.sdlc/registry.json``, XDG-aware). A run whose process has died without a
     clean finish surfaces as ``DEAD`` rather than lingering as in-progress;
-    ``--prune`` drops those entries. Each repo's own ledger stays authoritative
+    ``--prune`` drops those entries, and ``--prune --finished`` also drops
+    finished rows (a resolved FAILED/ABORTED run). Each repo's own ledger stays authoritative
     for run detail. Exits 0 even when empty — no runs means "nothing started".
     """
     from sdlc.registry import Registry
 
+    if finished and not prune:
+        raise typer.BadParameter("--finished requires --prune")
     registry = Registry()
     if prune:
-        removed = registry.prune()
+        removed = registry.prune(include_finished=finished)
         if not as_json:
-            typer.echo(f"pruned {removed} dead run(s).")
+            typer.echo(f"pruned {removed} run(s)." if finished else f"pruned {removed} dead run(s).")
 
     if active:
         for run in registry.active_sdlc_runs():

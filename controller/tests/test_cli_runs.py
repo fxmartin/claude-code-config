@@ -139,3 +139,41 @@ def test_runs_active_is_silent_with_nothing_live(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert result.output == ""
+
+
+def _seed_finished(path: Path) -> Registry:
+    reg = _seed(path)
+    for run_id, status in (("33333333-cccc", "FAILED"), ("44444444-dddd", "ABORTED")):
+        reg.register(
+            RunRecord(run_id=run_id, repo="/repo/gamma", db="/repo/gamma/.sdlc-state.db",
+                      scope="epic-13", pid=DEAD_PID, status=status,
+                      started_at="2026-06-20T10:00:00+00:00",
+                      finished_at="2026-06-20T11:00:00+00:00")
+        )
+    return reg
+
+
+def test_runs_prune_keeps_finished_runs_by_default(tmp_path, monkeypatch):
+    path = tmp_path / "registry.json"
+    reg = _seed_finished(path)
+    monkeypatch.setenv("SDLC_REGISTRY_PATH", str(path))
+
+    assert runner.invoke(app, ["runs", "--prune"]).exit_code == 0
+    assert {r.run_id for r in reg.records()} == {
+        "11111111-aaaa", "33333333-cccc", "44444444-dddd"}
+
+
+def test_runs_prune_finished_removes_failed_and_aborted(tmp_path, monkeypatch):
+    path = tmp_path / "registry.json"
+    reg = _seed_finished(path)
+    monkeypatch.setenv("SDLC_REGISTRY_PATH", str(path))
+
+    result = runner.invoke(app, ["runs", "--prune", "--finished"])
+    assert result.exit_code == 0
+    assert {r.run_id for r in reg.records()} == {"11111111-aaaa"}
+
+
+def test_runs_finished_without_prune_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("SDLC_REGISTRY_PATH", str(tmp_path / "registry.json"))
+    result = runner.invoke(app, ["runs", "--finished"])
+    assert result.exit_code != 0

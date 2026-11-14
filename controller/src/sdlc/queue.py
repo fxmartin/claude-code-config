@@ -101,8 +101,10 @@ _TERMINAL_STATES = {"done", "failed", "blocked", "needs_attention"}
 # abandonable when FX decides the change request is not going to be approved. A
 # ``running`` job belongs to a live scheduler and its child, so cancelling it
 # only *asks* that holder to stop (``cancel_requested``, Story 35.4-003); a
-# ``done``/``failed`` job is history worth keeping and is not cancellable.
-_CANCELLABLE_STATES = {"queued", "blocked", "parked", "needs_attention"}
+# ``done`` job is history worth keeping and is not cancellable. A ``failed`` job
+# is cancellable so a resolved failure can be dismissed: cancelling keeps its
+# ``reason`` and starts no work (``requeue`` would re-run it and null the reason).
+_CANCELLABLE_STATES = {"queued", "blocked", "parked", "needs_attention", "failed"}
 
 # States an operator may re-arm with :meth:`QueueStore.requeue_job`. ``queued``
 # is excluded because it is already armed, ``running`` because it is live.

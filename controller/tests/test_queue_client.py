@@ -769,3 +769,12 @@ def test_unpause_pool_from_the_xps_resumes_only_that_pool(
     assert [p.pool for p in store.dispatch_pauses()] == ["codex-shared"]
     listing = json.loads(runner.invoke(app, ["queue", "list", "--json"]).output)
     assert [p["pool"] for p in listing["pauses"]] == ["codex-shared"]
+
+
+def test_client_cancel_dismisses_a_failed_job_and_keeps_its_reason(client: QueueClient) -> None:
+    job_id = client.add_job(repo="/r", kind="build", scope="s")
+    client.claim_next(claimed_by="w", lease_seconds=60)
+    client.finish_job(job_id, "failed", reason="build_failed: gate", claimed_by="w")
+    client.cancel_job(job_id)
+    job = client.get_job(job_id)
+    assert (job.state, job.reason) == ("cancelled", "build_failed: gate")  # type: ignore[union-attr]
