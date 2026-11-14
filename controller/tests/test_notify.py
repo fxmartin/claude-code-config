@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 
 import pytest
 
@@ -11,7 +13,7 @@ from sdlc import notify as notify_mod
 
 
 @pytest.fixture(autouse=True)
-def _isolate_env(monkeypatch):
+def _isolate_env(monkeypatch, tmp_path):
     """Give every test a clean, configured environment by default.
 
     Individual tests override pieces (clear a credential, flip SDLC_NOTIFY) to
@@ -23,6 +25,10 @@ def _isolate_env(monkeypatch):
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat456")
     monkeypatch.delenv("SDLC_NOTIFY", raising=False)
     monkeypatch.delenv("SDLC_WORKER", raising=False)
+    # Never reach a real 1Password or the real ~/.claude from a test.
+    monkeypatch.setattr(notify_mod, "_op_read", lambda ref: None)
+    monkeypatch.setattr(notify_mod, "_ENV_FILE", tmp_path / "no-such.env")
+    monkeypatch.setattr(notify_mod, "_LOG_FILE", tmp_path / "logs" / "notify-telegram.log")
 
 
 def _collector():
@@ -720,3 +726,107 @@ def test_a_pool_without_a_reset_time_names_the_pool_only():
 def test_an_out_of_range_epoch_reset_falls_back_to_the_raw_value():
     text = _text("rate_limited", repo="alpha", reset_at=10**30, pool="claude-shared")
     assert f"resumes {10**30}" in text
+
+
+# --- credential order and visibility (issue #974) ----------------------------
+
+
+def _clear_creds(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+
+def test_resolve_order_env_over_file_over_op(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("TELEGRAM_BOT_TOKEN=filetok\nTELEGRAM_CHAT_ID=filechat\n")
+    monkeypatch.setattr(notify_mod, "_ENV_FILE", env_file)
+    monkeypatch.setattr(notify_mod, "_op_read", lambda ref: "optok")
+    # env set for the token only: token from env, chat from file, op unused.
+    monkeypatch.delenv("TELEGRAM_CHAT_ID")
+    creds = notify_mod.resolve_creds()
+    assert (creds.token, creds.token_source) == ("tok123", "env")
+    assert (creds.chat, creds.chat_source) == ("filechat", "file")
+
+
+def test_resolve_uses_op_when_env_and_file_absent(monkeypatch):
+    _clear_creds(monkeypatch)
+    refs = []
+
+    def fake_op(ref):
+        refs.append(ref)
+        return "op-" + ref.rsplit("/", 1)[1].replace(" ", "")
+
+    monkeypatch.setattr(notify_mod, "_op_read", fake_op)
+    creds = notify_mod.resolve_creds()
+    assert (creds.token, creds.token_source) == ("op-bottoken", "op")
+    assert (creds.chat, creds.chat_source) == ("op-ID", "op")
+    assert refs == ["op://Private/Telegram/bot token", "op://Private/Telegram/ID"]
+
+
+def test_op_refs_are_overridable(monkeypatch):
+    _clear_creds(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_OP_TOKEN_REF", "op://V/I/t")
+    monkeypatch.setenv("TELEGRAM_OP_CHAT_REF", "op://V/I/c")
+    seen = []
+    monkeypatch.setattr(notify_mod, "_op_read", lambda ref: seen.append(ref) or "x")
+    notify_mod.resolve_creds()
+    assert seen == ["op://V/I/t", "op://V/I/c"]
+
+
+def _fake_op_on_path(monkeypatch, tmp_path, body):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    op = bindir / "op"
+    op.write_text(f"#!/bin/sh\n{body}\n")
+    op.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+
+
+def test_op_read_returns_first_line_of_a_working_op(monkeypatch, tmp_path):
+    monkeypatch.undo()  # drop the autouse _op_read stub
+    _fake_op_on_path(monkeypatch, tmp_path, 'echo "secret-$2"')
+    assert notify_mod._op_read("op://x") == "secret-op://x"
+
+
+def test_op_read_skips_a_failing_op(monkeypatch, tmp_path):
+    monkeypatch.undo()
+    _fake_op_on_path(monkeypatch, tmp_path, "exit 1")
+    assert notify_mod._op_read("op://x") is None
+
+
+def test_op_read_skips_a_hanging_op_within_the_timeout(monkeypatch, tmp_path):
+    monkeypatch.undo()
+    _fake_op_on_path(monkeypatch, tmp_path, "sleep 30")
+    monkeypatch.setenv("TELEGRAM_OP_TIMEOUT", "1")
+    start = time.monotonic()
+    assert notify_mod._op_read("op://x") is None
+    assert time.monotonic() - start < 15
+
+
+def test_op_read_is_none_without_op_on_path(monkeypatch, tmp_path):
+    monkeypatch.undo()
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert notify_mod._op_read("op://x") is None
+
+
+def test_unconfigured_logs_one_line_per_day(monkeypatch):
+    _clear_creds(monkeypatch)
+    for _ in range(3):
+        notify_mod.notify("run_started")
+    lines = notify_mod._LOG_FILE.read_text().splitlines()
+    assert len(lines) == 1
+    assert "telegram unconfigured" in lines[0]
+
+
+def test_unconfigured_logs_again_on_a_new_day(monkeypatch):
+    _clear_creds(monkeypatch)
+    notify_mod._LOG_FILE.parent.mkdir(parents=True)
+    notify_mod._LOG_FILE.write_text("2020-01-01T00:00:00+0000 telegram unconfigured: old\n")
+    notify_mod.notify("run_started")
+    assert len(notify_mod._LOG_FILE.read_text().splitlines()) == 2
+
+
+def test_configured_host_logs_nothing(monkeypatch):
+    sent, sender = _collector()
+    notify_mod.notify("run_started", sender=sender)
+    assert sent and not notify_mod._LOG_FILE.exists()

@@ -22,6 +22,7 @@ from sdlc.build import Ledger
 from sdlc.cli import app
 from sdlc.doctor import (
     check_run_versions,
+    check_telegram,
     FOREIGN_SKILL_NAMES,
     MANAGED_PATHS,
     DoctorReport,
@@ -99,6 +100,13 @@ def _marketplace_settings(path: Path) -> dict:
             "fx-claude-config": {"source": {"source": "directory", "path": str(path)}}
         }
     }
+
+
+@pytest.fixture(autouse=True)
+def _telegram_configured(monkeypatch) -> None:
+    """Keep doctor tests off the real host's credentials and 1Password."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat")
 
 
 def _fresh_ledger(tmp_path: Path) -> Path:
@@ -2561,3 +2569,34 @@ def test_doctor_ignores_a_finished_run_on_an_older_controller(tmp_path) -> None:
     registry.mark_finished("48c748ba", "DONE")
 
     assert check_run_versions(registry, installed_version="2.126.1").status == "CLEAN"
+
+
+# --- telegram ---------------------------------------------------------------
+
+
+def test_telegram_clean_when_configured(tmp_path: Path) -> None:
+    finding = _finding(_doctor(tmp_path), "telegram")
+    assert finding.status == "CLEAN"
+    assert "tok" not in finding.detail.replace("token", "")
+
+
+def test_telegram_unconfigured_warns_with_the_fix(tmp_path: Path, monkeypatch) -> None:
+    from sdlc import notify
+
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
+    monkeypatch.delenv("TELEGRAM_CHAT_ID")
+    monkeypatch.setattr(notify, "_op_read", lambda ref: None)
+    monkeypatch.setattr(notify, "_ENV_FILE", tmp_path / "no.env")
+    report = _doctor(tmp_path)
+    finding = _finding(report, "telegram")
+    assert finding.status == "WARN"
+    assert "telegram: unconfigured" in finding.detail
+    assert "setup-telegram.sh" in finding.remedy
+    assert _finding(report, "telegram").to_dict()["detail"].startswith("telegram: unconfigured")
+
+
+def test_telegram_uses_the_injected_resolver() -> None:
+    from sdlc.notify import Creds
+
+    assert check_telegram(lambda: Creds("t", "c", "op", "op")).status == "CLEAN"
+    assert check_telegram(lambda: Creds(None, "c", None, "file")).status == "WARN"
