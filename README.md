@@ -424,7 +424,7 @@ Long-running autonomous runs mirror lifecycle milestones to Telegram so you can 
 
 On a fleet, a run message carries `worker=<name>` (the worker that ran it, from `SDLC_WORKER`), and a rate-limit pause carries `pool=<name>` and `resumes <time>` so the notice is attributable to a subscription. Local mode omits both fields.
 
-Both paths are best-effort and Telegram-only: credentials come from `$TELEGRAM_BOT_TOKEN` / `$TELEGRAM_CHAT_ID` (env first, then `~/.claude/config/.env`), and every call is a silent no-op when unconfigured.
+Both paths are best-effort and Telegram-only: credentials come from `$TELEGRAM_BOT_TOKEN` / `$TELEGRAM_CHAT_ID` (env first, then `~/.claude/config/.env`, then a non-interactive `op read` of `op://Private/Telegram/bot token` and `op://Private/Telegram/ID`). Run `scripts/setup-telegram.sh` once per host to write the `.env` from 1Password. An unconfigured host never fails a caller, but it logs one line a day to `~/.claude/logs/notify-telegram.log` and `sdlc doctor` reports `telegram: unconfigured`.
 
 ---
 
@@ -680,6 +680,7 @@ Copy `.env.example` to `.env` and fill in:
 | `BROWSER_PATH` | Absolute path to a Chromium-based browser for the Playwright MCP server |
 | `TELEGRAM_BOT_TOKEN` | Optional — enables Telegram notifications via `hooks/notify-telegram.sh` and the `/telegram` skill |
 | `TELEGRAM_CHAT_ID` | Optional — target chat for Telegram notifications |
+| `TELEGRAM_OP_TOKEN_REF` / `TELEGRAM_OP_CHAT_REF` | Optional — 1Password references used when env and `.env` are empty (default `op://Private/Telegram/bot token`, `op://Private/Telegram/ID`) |
 
 ---
 

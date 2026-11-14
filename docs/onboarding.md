@@ -276,7 +276,7 @@ These are **opt-in**. Skip them on your first install and add them later if you 
 
 ### Telegram notifications
 
-Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in your `.env`, and the harness sends a message to your phone on:
+Run `scripts/setup-telegram.sh` (writes `~/.claude/config/.env` from 1Password `op://Private/Telegram/bot token` and `op://Private/Telegram/ID`, mode 600, prints only `written`), or set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` yourself. Resolution order is environment, `.env` file, then a non-interactive `op read`. `sdlc doctor` reports `telegram: unconfigured` when none works. Once configured, the harness sends a message to your phone on:
 
 - Run start
 - First failure

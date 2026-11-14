@@ -1,5 +1,7 @@
 # Telegram Bot API Instructions
 
+Credentials: `scripts/setup-telegram.sh` writes `~/.claude/config/.env` from 1Password. The notifier hook resolves env, then that file, then `op read`.
+
 ## Sending Messages
 
 Endpoint: `POST https://api.telegram.org/bot<token>/sendMessage`

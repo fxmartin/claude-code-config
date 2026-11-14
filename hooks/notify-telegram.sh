@@ -1,6 +1,6 @@
 #!/bin/bash
 # ABOUTME: Standalone Telegram notifier for autonomous skills (no terminal deps).
-# ABOUTME: Usage: notify-telegram.sh <title> <body>. Silent no-op when unconfigured.
+# ABOUTME: Usage: notify-telegram.sh <title> <body>. Logs once a day and no-ops when unconfigured.
 
 set -euo pipefail
 
@@ -24,8 +24,69 @@ _repo_tag() {
     basename "$PARENT"
 }
 
-# Send a Telegram message. Credentials come from the environment first, then
-# from ~/.claude/config/.env as a fallback (mirroring controller/notify.py).
+# --- Credential resolution ----------------------------------------------------
+# Order, per variable: environment, then ~/.claude/config/.env, then a
+# non-interactive `op read` of 1Password. Mirrors controller/src/sdlc/notify.py.
+# The .env file is parsed, never sourced, so it cannot run code.
+
+TELEGRAM_OP_TOKEN_REF="${TELEGRAM_OP_TOKEN_REF:-op://Private/Telegram/bot token}"
+TELEGRAM_OP_CHAT_REF="${TELEGRAM_OP_CHAT_REF:-op://Private/Telegram/ID}"
+_OP_TIMEOUT="${TELEGRAM_OP_TIMEOUT:-5}"
+_LOG_FILE="${HOME}/.claude/logs/notify-telegram.log"
+
+# Print the value of NAME from the .env file ("" when absent or unreadable).
+_file_value() {
+    local NAME="$1" FILE="${HOME}/.claude/config/.env" LINE
+    [ -f "$FILE" ] || return 0
+    LINE=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${NAME}=" "$FILE" 2>/dev/null | tail -n 1) || return 0
+    LINE="${LINE#*=}"
+    LINE="${LINE%\"}"; LINE="${LINE#\"}"
+    LINE="${LINE%\'}"; LINE="${LINE#\'}"
+    printf '%s' "$LINE"
+}
+
+# Print the 1Password value for REF, or nothing. Never prompts or blocks:
+# needs `op` and a timeout binary, stdin is /dev/null, output goes to a file
+# (a pipe would stay open under a hung grandchild), and any failure is skipped.
+_op_value() {
+    local REF="$1" TMO OUT RC=0
+    command -v op >/dev/null 2>&1 || return 0
+    TMO=$(command -v timeout || command -v gtimeout) || return 0
+    OUT=$(mktemp 2>/dev/null) || return 0
+    "$TMO" "$_OP_TIMEOUT" op read "$REF" </dev/null >"$OUT" 2>/dev/null || RC=$?
+    [ "$RC" -eq 0 ] && head -n 1 "$OUT"
+    rm -f "$OUT"
+    return 0
+}
+
+# Resolve credentials into TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID and record
+# where each came from in TOKEN_SOURCE / CHAT_SOURCE (env|file|op|"").
+_resolve_creds() {
+    TOKEN_SOURCE="" CHAT_SOURCE=""
+    local V
+    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then TOKEN_SOURCE="env"
+    elif V=$(_file_value TELEGRAM_BOT_TOKEN) && [ -n "$V" ]; then TELEGRAM_BOT_TOKEN="$V"; TOKEN_SOURCE="file"
+    elif V=$(_op_value "$TELEGRAM_OP_TOKEN_REF") && [ -n "$V" ]; then TELEGRAM_BOT_TOKEN="$V"; TOKEN_SOURCE="op"
+    fi
+    if [ -n "${TELEGRAM_CHAT_ID:-}" ]; then CHAT_SOURCE="env"
+    elif V=$(_file_value TELEGRAM_CHAT_ID) && [ -n "$V" ]; then TELEGRAM_CHAT_ID="$V"; CHAT_SOURCE="file"
+    elif V=$(_op_value "$TELEGRAM_OP_CHAT_REF") && [ -n "$V" ]; then TELEGRAM_CHAT_ID="$V"; CHAT_SOURCE="op"
+    fi
+}
+
+# Append one "unconfigured" line per calendar day so a silent host shows up.
+_log_unconfigured() {
+    local TODAY
+    TODAY=$(date '+%Y-%m-%d')
+    mkdir -p "$(dirname "$_LOG_FILE")" 2>/dev/null || return 0
+    if [ -f "$_LOG_FILE" ] && grep -q "^${TODAY}T.* telegram unconfigured" "$_LOG_FILE" 2>/dev/null; then
+        return 0
+    fi
+    printf '%s telegram unconfigured: no credentials from env, ~/.claude/config/.env or 1Password; run scripts/setup-telegram.sh\n' \
+        "$(date '+%Y-%m-%dT%H:%M:%S%z')" >> "$_LOG_FILE" 2>/dev/null || true
+}
+
+# Send a Telegram message. Never blocks or fails the caller.
 _send_telegram() {
     local TITLE="${1:-Notification}"
     local BODY="${2:-}"
@@ -33,22 +94,17 @@ _send_telegram() {
     REPO=$(_repo_tag)
     local TAGGED_TITLE="[${REPO}] ${TITLE}"
 
-    # Environment wins; otherwise source ~/.claude/config/.env if present.
-    # Silent no-op when neither yields credentials.
-    if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-        local ENV_FILE="${HOME}/.claude/config/.env"
-        # shellcheck disable=SC1090
-        [ -f "$ENV_FILE" ] && source "$ENV_FILE" 2>/dev/null || true
-    fi
+    local TOKEN_SOURCE CHAT_SOURCE
+    _resolve_creds
 
     if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-        # Unconfigured: silent no-op.
+        _log_unconfigured
         return 0
     fi
 
     if [ -n "${NOTIFY_DRYRUN:-}" ]; then
-        # Test hook: report the resolved credentials without hitting the network.
-        echo "[dry-run] telegram token=${TELEGRAM_BOT_TOKEN} chat=${TELEGRAM_CHAT_ID}"
+        # Test hook: report where each credential resolved, never its value.
+        echo "[dry-run] telegram token=resolved(${TOKEN_SOURCE}) chat=resolved(${CHAT_SOURCE})"
         return 0
     fi
 
@@ -67,7 +123,7 @@ ${BODY}" \
     if ! curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -H "Content-Type: application/json" \
         -d "$PAYLOAD" > /dev/null 2>&1; then
-        local LOG=~/.claude/logs/notify-telegram.log
+        local LOG="$_LOG_FILE"
         mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
         printf '%s telegram send failed: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$TAGGED_TITLE" \
             >> "$LOG" 2>/dev/null || true

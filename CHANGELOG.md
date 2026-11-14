@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- fix(notify): 1Password fallback for Telegram credentials, daily log line and `sdlc doctor` check for an unconfigured host, dry-run no longer prints the token, `scripts/setup-telegram.sh` (#974)
+
 ## [v2.135.1] - 2026-11-14
 
 ### Fixed
