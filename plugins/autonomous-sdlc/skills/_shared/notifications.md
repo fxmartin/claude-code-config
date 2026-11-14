@@ -14,7 +14,7 @@ bash -c '~/.claude/hooks/notify-telegram.sh "<title>" "<body>"'
 Rules:
 
 - Call the hook **unconditionally** at each milestone the skill marks — it is
-  Telegram-only and a **no-op when unconfigured**, so no guard or
+  Telegram-only and a **silent no-op when unconfigured** (on the skill side; the host logs it), so no guard or
   configuration check is needed. An unconfigured host is never silent: the hook
   appends one line a day to `~/.claude/logs/notify-telegram.log` and
   `sdlc doctor` reports `telegram: unconfigured` with the fix.

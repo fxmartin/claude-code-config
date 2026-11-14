@@ -21,7 +21,7 @@ import tomllib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import yaml
 
@@ -2617,7 +2617,7 @@ def check_model_pricing(db_path: Path) -> Finding:
     )
 
 
-def check_telegram(resolver: Callable[[], object] | None = None) -> Finding:
+def check_telegram(resolver: Callable[[], Any] | None = None) -> Finding:
     """WARN when no source yields Telegram credentials, so dropped pings are visible.
 
     Uses the notifier's own resolution order (env, ``.env`` file, 1Password),
