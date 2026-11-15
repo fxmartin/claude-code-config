@@ -36,6 +36,11 @@ export SDLC_DISABLED_HOOKS="notify-telegram"
 export SDLC_DISABLED_HOOKS="notify-telegram,worktree-gc"
 ```
 
+`hooks/notify-session-event.sh` registers as the `notification`-class hook
+`notify-session-event`, so `minimal` and `SDLC_DISABLED_HOOKS="notify-session-event"`
+silence the Notification/Stop pings. `CLAUDE_NOTIFY_SESSION=0` does the same for a
+single session.
+
 Under the `strict` profile, an entry that names a guardrail-class hook has no
 effect — guardrails are not user-disablable in strict mode.
 

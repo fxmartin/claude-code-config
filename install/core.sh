@@ -239,6 +239,47 @@ register_local_marketplace() {
   fi
 }
 
+# register_session_notify_hook(): add the notify-session-event hook to an
+# existing settings.json (#975). settings.json is seeded once and never
+# overwritten, so machines installed before this hook landed need the
+# Notification entry and the extra Stop command merged in. Idempotent: a no-op
+# once the command is present. Degrades to a note without jq or settings.json.
+register_session_notify_hook() {
+  local settings="$SCRIPT_DIR/settings.json"
+  # shellcheck disable=SC2088 # settings.json stores the literal ~ path
+  local cmd="~/.claude/hooks/notify-session-event.sh"
+  if [ ! -f "$settings" ]; then
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    warn "jq not found; notify-session-event hook not added to settings.json (#975)"
+    return 0
+  fi
+  if jq -e --arg c "$cmd" '([.hooks.Stop[]?.hooks[]?.command] | index($c) != null) and ([.hooks.Notification[]?.hooks[]?.command] | index($c) != null)' "$settings" >/dev/null 2>&1; then
+    info "notify-session-event hook already registered in settings.json"
+    return 0
+  fi
+  if [ "${DRY_RUN:-false}" = "true" ]; then
+    echo "  [dry-run] jq: settings.json hooks.Notification + hooks.Stop += notify-session-event.sh"
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp "$settings.XXXXXX")"
+  if jq --arg c "$cmd" '
+      def entry: {type: "command", command: $c, timeout: 10};
+      def has_cmd(ev): [.hooks[ev][]?.hooks[]?.command] | index($c) != null;
+      .hooks //= {}
+      | if has_cmd("Stop") then . else .hooks.Stop = ((.hooks.Stop // []) + [{hooks: [entry]}]) end
+      | if has_cmd("Notification") then . else .hooks.Notification = ((.hooks.Notification // []) + [{hooks: [entry]}]) end
+    ' "$settings" >"$tmp"; then
+    mv "$tmp" "$settings"
+    info "Registered notify-session-event hook for Notification and Stop"
+  else
+    rm -f "$tmp"
+    warn "could not rewrite settings.json; notify-session-event hook not added"
+  fi
+}
+
 install_core_run() {
   # Guard (#179): refuse to install from an ephemeral build worktree. --core
   # symlinks every managed ~/.claude entry to $SCRIPT_DIR; if SCRIPT_DIR is a
@@ -318,6 +359,7 @@ install_core_run() {
   # installLocation — remove ours if present (remove_symlink only unlinks a
   # link pointing at this repo).
   register_local_marketplace
+  register_session_notify_hook
   remove_symlink "$CLAUDE_DIR/plugins/marketplaces/fx-claude-config" "$SCRIPT_DIR"
 
   # Build-harness adapters on PATH (Story 21.3-001). The harness registry invokes
