@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.136.0] - 2026-11-15
+
+### Added
+
+- feat(hooks): telegram ping on session wait or long turn (#977)
+
+
 ## [v2.135.2] - 2026-11-15
 
 ### Fixed
