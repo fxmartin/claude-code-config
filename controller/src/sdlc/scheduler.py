@@ -1473,7 +1473,7 @@ class _Scheduler:
         after the run's own pid check.
         """
         profile = self._config.worker
-        if profile is None or job.worker in (None, profile.name):
+        if profile is None or job.worker is None or job.worker == profile.name:
             return False
         return self._store.get_worker(job.worker) is not None
 

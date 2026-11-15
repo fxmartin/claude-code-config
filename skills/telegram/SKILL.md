@@ -28,6 +28,8 @@ Before sending, verify:
    TELEGRAM_BOT_TOKEN="your-bot-token-here"
    TELEGRAM_CHAT_ID="your-chat-id-here"
    ```
+   Or run `scripts/setup-telegram.sh` to write the file from 1Password (`op://Private/Telegram/bot token`, `op://Private/Telegram/ID`).
+
    Get a token from [@BotFather](https://t.me/BotFather) on Telegram.
 2. A chat ID is available — either from `--chat:<id>` flag or `TELEGRAM_CHAT_ID` from `.env`.
    To find a chat ID, read `${CLAUDE_SKILL_DIR}/instructions.md` for the lookup method.

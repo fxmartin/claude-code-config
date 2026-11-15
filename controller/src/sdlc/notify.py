@@ -1,5 +1,5 @@
 # ABOUTME: Best-effort Telegram lifecycle notifications for the sdlc controller.
-# ABOUTME: Stdlib-only, never raises, silent no-op when unconfigured or disabled.
+# ABOUTME: Stdlib-only, never raises, no-op when unconfigured (logged daily) or disabled.
 
 """Deterministic run-lifecycle notifications, decoupled from cmux.
 
@@ -10,7 +10,9 @@ swallows all errors so a broken or unreachable notifier can never fail a build.
 
 Configuration:
     TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  — credentials (env first, then
-        ``~/.claude/config/.env`` as a fallback, mirroring cmux-bridge.sh).
+        ``~/.claude/config/.env``, then a non-interactive ``op read`` of
+        ``TELEGRAM_OP_TOKEN_REF`` / ``TELEGRAM_OP_CHAT_REF``). An unconfigured
+        host logs one line a day to ``~/.claude/logs/notify-telegram.log``.
     SDLC_NOTIFY                            — set to ``off``/``false`` to mute
         (anything else, or unset, means on).
 
@@ -21,7 +23,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import signal
+import subprocess
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -38,39 +44,140 @@ _TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 Sender = Callable[[str, bytes], None]
 
 
-def _load_creds() -> tuple[str | None, str | None]:
-    """Resolve the bot token and chat id.
+_LOG_FILE = Path.home() / ".claude" / "logs" / "notify-telegram.log"
 
-    Environment variables win; otherwise fall back to a tiny stdlib parse of
-    ``~/.claude/config/.env`` (no python-dotenv). Missing file or unreadable
-    values yield ``None`` so the caller no-ops cleanly.
-    """
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat = os.environ.get("TELEGRAM_CHAT_ID")
-    if token and chat:
-        return token, chat
+_DEFAULT_OP_TOKEN_REF = "op://Private/Telegram/bot token"
+_DEFAULT_OP_CHAT_REF = "op://Private/Telegram/ID"
+_DEFAULT_OP_TIMEOUT_S = 5.0
 
-    file_vals: dict[str, str] = {}
+UNCONFIGURED_FIX = "run scripts/setup-telegram.sh (writes ~/.claude/config/.env from 1Password)"
+
+
+def _op_timeout() -> float:
     try:
-        if _ENV_FILE.is_file():
-            for raw in _ENV_FILE.read_text(encoding="utf-8").splitlines():
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                if line.startswith("export "):
-                    line = line[len("export "):]
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key:
-                    file_vals[key] = value
-    except OSError:
-        # Unreadable .env is not fatal — treat as unconfigured.
-        return token, chat
+        return float(os.environ.get("TELEGRAM_OP_TIMEOUT", _DEFAULT_OP_TIMEOUT_S))
+    except ValueError:
+        return _DEFAULT_OP_TIMEOUT_S
 
-    token = token or file_vals.get("TELEGRAM_BOT_TOKEN")
-    chat = chat or file_vals.get("TELEGRAM_CHAT_ID")
-    return token, chat
+
+def _op_read(ref: str) -> str | None:
+    """``op read ref`` without ever prompting or blocking; ``None`` on any failure.
+
+    Needs ``op`` on PATH. Stdin is ``/dev/null`` and the child gets its own
+    process group, so a hung ``op`` (or a grandchild holding the pipe) is killed
+    whole at the timeout instead of stalling the caller.
+    """
+    exe = shutil.which("op")
+    if exe is None:
+        return None
+    try:
+        proc = subprocess.Popen(
+            [exe, "read", ref],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError:
+        return None
+    try:
+        out, _ = proc.communicate(timeout=_op_timeout())
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.communicate()
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = out.strip().splitlines()
+    return lines[0].strip() or None if lines else None
+
+
+def _read_env_file() -> dict[str, str]:
+    """Tiny stdlib parse of the ``.env`` file; unreadable or missing yields ``{}``."""
+    values: dict[str, str] = {}
+    try:
+        if not _ENV_FILE.is_file():
+            return values
+        for raw in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):]
+            key, _, value = line.partition("=")
+            key = key.strip()
+            if key:
+                values[key] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return values
+
+
+@dataclass(frozen=True)
+class Creds:
+    """Resolved Telegram credentials and where each came from (env|file|op)."""
+
+    token: str | None
+    chat: str | None
+    token_source: str | None
+    chat_source: str | None
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.token and self.chat)
+
+
+def resolve_creds() -> Creds:
+    """Resolve token and chat id, per variable: environment, ``.env`` file, then 1Password.
+
+    Same order as ``hooks/notify-telegram.sh``. The 1Password fallback is only
+    consulted for a variable the first two sources left empty.
+    """
+    file_vals = _read_env_file()
+    op_refs = {
+        "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_OP_TOKEN_REF") or _DEFAULT_OP_TOKEN_REF,
+        "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_OP_CHAT_REF") or _DEFAULT_OP_CHAT_REF,
+    }
+
+    def one(name: str) -> tuple[str | None, str | None]:
+        if os.environ.get(name):
+            return os.environ[name], "env"
+        if file_vals.get(name):
+            return file_vals[name], "file"
+        value = _op_read(op_refs[name])
+        return (value, "op") if value else (None, None)
+
+    token, token_source = one("TELEGRAM_BOT_TOKEN")
+    chat, chat_source = one("TELEGRAM_CHAT_ID")
+    return Creds(token, chat, token_source, chat_source)
+
+
+def _load_creds() -> tuple[str | None, str | None]:
+    """The ``(token, chat)`` pair from :func:`resolve_creds` (``None`` when unresolved)."""
+    creds = resolve_creds()
+    return creds.token, creds.chat
+
+
+def log_unconfigured() -> None:
+    """Append one "unconfigured" line to the notify log, at most once per day."""
+    try:
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        if _LOG_FILE.is_file() and any(
+            line.startswith(today) and "telegram unconfigured" in line
+            for line in _LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+        ):
+            return
+        _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+        with _LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(f"{stamp} telegram unconfigured: no credentials from env, "
+                     f"~/.claude/config/.env or 1Password; {UNCONFIGURED_FIX}\n")
+    except OSError:
+        pass
 
 
 def _default_sender(url: str, payload: bytes) -> None:
@@ -101,6 +208,7 @@ def _send_telegram(title: str, body: str, *, sender: Sender | None = None) -> No
     """
     token, chat = _load_creds()
     if not token or not chat:
+        log_unconfigured()
         return
     text = f"[sdlc] {title}\n{body}" if body else f"[sdlc] {title}"
     payload = json.dumps({"chat_id": chat, "text": text}).encode("utf-8")

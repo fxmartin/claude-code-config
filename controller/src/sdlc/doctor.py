@@ -21,7 +21,7 @@ import tomllib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import yaml
 
@@ -2617,6 +2617,27 @@ def check_model_pricing(db_path: Path) -> Finding:
     )
 
 
+def check_telegram(resolver: Callable[[], Any] | None = None) -> Finding:
+    """WARN when no source yields Telegram credentials, so dropped pings are visible.
+
+    Uses the notifier's own resolution order (env, ``.env`` file, 1Password),
+    so doctor agrees with what the hook and controller will actually do.
+    """
+    from sdlc import notify
+
+    creds = (resolver or notify.resolve_creds)()
+    if getattr(creds, "configured", False):
+        return Finding(
+            "telegram", "Telegram", "CLEAN",
+            f"token from {creds.token_source}, chat id from {creds.chat_source}",
+        )
+    return Finding(
+        "telegram", "Telegram", "WARN",
+        "telegram: unconfigured — skill and controller pings are silently dropped",
+        notify.UNCONFIGURED_FIX,
+    )
+
+
 def check_model_probe(
     *,
     runner=None,
@@ -2785,6 +2806,7 @@ def run_doctor(
     dep_probe: Callable[[str], bool] | None = None,
     now: datetime | None = None,
     stale_after_s: int = _STALE_AFTER_S,
+    telegram_resolver: Callable[[], object] | None = None,
 ) -> DoctorReport:
     """Run every health-check and return the aggregated :class:`DoctorReport`.
 
@@ -2823,6 +2845,7 @@ def run_doctor(
         check_model_pricing(db_path),
         check_stashes(repo_root),
         check_model_probe(),
+        check_telegram(telegram_resolver),
     ]
     findings.extend(check_dependencies(dep_probe))
     findings.append(check_glab_dependency(repo_root, dep_probe))

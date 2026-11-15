@@ -151,7 +151,8 @@ run_in_disable() {
         TELEGRAM_BOT_TOKEN="tok-default" TELEGRAM_CHAT_ID="1" \
         bash "$NOTIFY" "Title" "Body"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"tok-default"* ]]
+    [[ "$output" == *"token=resolved(env)"* ]]
+    [[ "$output" != *"tok-default"* ]]
 }
 
 @test "notify-telegram is skipped under the minimal profile" {
@@ -175,7 +176,8 @@ run_in_disable() {
         TELEGRAM_BOT_TOKEN="tok-strict" TELEGRAM_CHAT_ID="1" \
         bash "$NOTIFY" "Title" "Body"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"tok-strict"* ]]
+    [[ "$output" == *"token=resolved(env)"* ]]
+    [[ "$output" != *"tok-strict"* ]]
 }
 
 # --- integration: session-context wires the cap end-to-end -------------------

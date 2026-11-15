@@ -7,6 +7,20 @@ setup() {
     NOTIFY="$REPO_ROOT/hooks/notify-telegram.sh"
     # Isolated fake HOME so we never touch the real ~/.claude.
     FAKE_HOME="$(mktemp -d)"
+    # A failing fake `op` first on PATH keeps every test off a real 1Password;
+    # tests that need a working or hanging `op` overwrite it via _fake_op.
+    OP_BIN="$FAKE_HOME/opbin"
+    mkdir -p "$OP_BIN"
+    _fake_op 'exit 1'
+    export PATH="$OP_BIN:$PATH"
+    export TELEGRAM_OP_TIMEOUT=1
+    LOG="$FAKE_HOME/.claude/logs/notify-telegram.log"
+}
+
+# Install a fake `op` whose body is the given shell snippet.
+_fake_op() {
+    printf '#!/bin/sh\n%s\n' "$1" > "$OP_BIN/op"
+    chmod +x "$OP_BIN/op"
 }
 
 teardown() {
@@ -28,8 +42,9 @@ EOF
         TELEGRAM_BOT_TOKEN="env-token-123" TELEGRAM_CHAT_ID="42" \
         bash "$NOTIFY" "Test" "Body"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"env-token-123"* ]]
-    [[ "$output" == *"chat=42"* ]]
+    [[ "$output" == *"token=resolved(env)"* ]]
+    [[ "$output" == *"chat=resolved(env)"* ]]
+    [[ "$output" != *"env-token-123"* ]]
 }
 
 @test "dry-run resolves credentials from ~/.claude/config/.env" {
@@ -38,7 +53,8 @@ EOF
         HOME="$FAKE_HOME" NOTIFY_DRYRUN=1 \
         bash "$NOTIFY" "Test" "Body"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"file-token-456"* ]]
+    [[ "$output" == *"token=resolved(file)"* ]]
+    [[ "$output" != *"file-token-456"* ]]
 }
 
 @test "environment credentials win over the .env file" {
@@ -47,7 +63,8 @@ EOF
         TELEGRAM_BOT_TOKEN="env-wins-token" TELEGRAM_CHAT_ID="7" \
         bash "$NOTIFY" "Test" "Body"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"env-wins-token"* ]]
+    [[ "$output" == *"token=resolved(env)"* ]]
+    [[ "$output" != *"env-wins-token"* ]]
     [[ "$output" != *"stale-file-token"* ]]
 }
 
@@ -136,4 +153,101 @@ line $body'
     # The run itself exits 0 regardless of where the repo tag comes from.
     [ "$status" -eq 0 ]
     rm -rf "$TMP_DIR"
+}
+
+# --- 1Password fallback (issue #974) ---------------------------------------
+
+_op_answers() {
+    _fake_op 'case "$2" in
+  "op://Private/Telegram/bot token") echo op-token-secret ;;
+  "op://Private/Telegram/ID") echo 555 ;;
+  *) exit 1 ;;
+esac'
+}
+
+@test "file wins over op" {
+    _stage_env_file "file-token"
+    _op_answers
+    run env -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID \
+        HOME="$FAKE_HOME" NOTIFY_DRYRUN=1 bash "$NOTIFY" T B
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"token=resolved(file)"* ]]
+}
+
+@test "op is used when env and file are absent" {
+    _op_answers
+    run env -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID \
+        HOME="$FAKE_HOME" NOTIFY_DRYRUN=1 bash "$NOTIFY" T B
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"token=resolved(op)"* ]]
+    [[ "$output" == *"chat=resolved(op)"* ]]
+    [[ "$output" != *"op-token-secret"* ]]
+}
+
+@test "op references are overridable" {
+    _fake_op '[ "$2" = "op://V/I/tok" ] && echo t || { [ "$2" = "op://V/I/chat" ] && echo c; }'
+    run env -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID \
+        HOME="$FAKE_HOME" NOTIFY_DRYRUN=1 \
+        TELEGRAM_OP_TOKEN_REF="op://V/I/tok" TELEGRAM_OP_CHAT_REF="op://V/I/chat" \
+        bash "$NOTIFY" T B
+    [[ "$output" == *"token=resolved(op)"* ]]
+}
+
+@test "a hanging op is skipped within the timeout" {
+    _fake_op 'sleep 30'
+    start=$SECONDS
+    run env -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID \
+        HOME="$FAKE_HOME" NOTIFY_DRYRUN=1 bash "$NOTIFY" T B
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ $((SECONDS - start)) -lt 15 ]
+}
+
+@test "a failing op is skipped and the host counts as unconfigured" {
+    run env -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID \
+        HOME="$FAKE_HOME" bash "$NOTIFY" T B
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    grep -q "telegram unconfigured" "$LOG"
+}
+
+# --- unconfigured visibility ----------------------------------------------
+
+@test "unconfigured writes exactly one log line per day" {
+    for _ in 1 2 3; do
+        env -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID HOME="$FAKE_HOME" bash "$NOTIFY" T B
+    done
+    [ "$(grep -c 'telegram unconfigured' "$LOG")" -eq 1 ]
+}
+
+@test "unconfigured logs again on a new day" {
+    mkdir -p "$(dirname "$LOG")"
+    echo "2020-01-01T00:00:00+0000 telegram unconfigured: old" > "$LOG"
+    env -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID HOME="$FAKE_HOME" bash "$NOTIFY" T B
+    [ "$(grep -c 'telegram unconfigured' "$LOG")" -eq 2 ]
+}
+
+@test "configured host writes no unconfigured line" {
+    run env HOME="$FAKE_HOME" NOTIFY_DRYRUN=1 TELEGRAM_BOT_TOKEN=x TELEGRAM_CHAT_ID=1 \
+        bash "$NOTIFY" T B
+    [ ! -f "$LOG" ]
+}
+
+# --- setup script ------------------------------------------------------------
+
+@test "setup-telegram writes a mode-600 .env and prints only 'written'" {
+    _op_answers
+    run env HOME="$FAKE_HOME" bash "$REPO_ROOT/scripts/setup-telegram.sh"
+    [ "$status" -eq 0 ]
+    [ "$output" = "written" ]
+    F="$FAKE_HOME/.claude/config/.env"
+    [ "$(stat -c %a "$F" 2>/dev/null || stat -f %Lp "$F")" = "600" ]
+    grep -q '^TELEGRAM_BOT_TOKEN=' "$F"
+    grep -q '^TELEGRAM_CHAT_ID=' "$F"
+}
+
+@test "setup-telegram fails without leaking and leaves no file when op fails" {
+    run env HOME="$FAKE_HOME" bash "$REPO_ROOT/scripts/setup-telegram.sh"
+    [ "$status" -ne 0 ]
+    [ ! -f "$FAKE_HOME/.claude/config/.env" ]
 }

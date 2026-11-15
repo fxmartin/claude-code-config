@@ -102,7 +102,7 @@ Optional machine-specific settings:
 cp .env.example .env
 ```
 
-Set `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` if you want run notifications.
+Run `scripts/setup-telegram.sh` if you want run notifications: it writes `~/.claude/config/.env` from 1Password (`op://Private/Telegram/bot token`, `op://Private/Telegram/ID`). `sdlc doctor` flags a host without credentials.
 `BROWSER_PATH` may stay unset on Linux: the installer auto-detects the first of
 `brave`, `chromium`, or `google-chrome-stable` on your PATH.
 
