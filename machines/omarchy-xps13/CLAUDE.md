@@ -39,15 +39,17 @@ Edit it in the repo and push to GitLab before and after, like any config.
 
 ## Machine Profile
 
-Surveyed 2026-11-08 without root. Refresh with `omarchy-debug --no-sudo --print`
+Surveyed 2026-11-08 without root; firmware, battery, disk, network and boot-log
+lines refreshed 2026-11-21. Refresh with `omarchy-debug --no-sudo --print`
 (call the binary directly: on 4.5.0 the `omarchy debug` dispatcher rejects the
 flags the shipped skill prescribes), `inxi -Fxxxz --no-sudo`, `hyprctl monitors`,
 `hyprctl devices`, `lsusb -t`, `boltctl list`, `bluetoothctl devices Connected`,
 `pacman -Qe`.
 
 **Identity and firmware**
-- Dell XPS 13 9350, board `0MMW13` rev A01, SKU `0CC9`. BIOS 1.24.1
-  (2026-08-03). UEFI 2.70, Secure Boot off, TPM 2.0 (`/dev/tpm0`), measured UKI.
+- Dell XPS 13 9350, board `0MMW13` rev A01, SKU `0CC9`. BIOS 1.26.0
+  (2026-09-21, installed through fwupd on 2026-11-21). UEFI 2.70, Secure Boot
+  off, TPM 2.0 (`/dev/tpm0`), measured UKI.
 - Omarchy 4.5.0-3 (`omarchy-version`), kernel `linux-omarchy` 7.2.15, systemd 262,
   Hyprland 0.56.2 under uwsm, SDDM display manager, Limine 12.9.4 bootloader.
 - Locale `en_US.UTF-8`, keyboard `fr` (console, X11 and Hyprland, option
@@ -72,7 +74,7 @@ flags the shipped skill prescribes), `inxi -Fxxxz --no-sudo`, `hyprctl monitors`
   SMART needs root (`smartctl`, `nvme smart-log`).
 - GPT: `nvme0n1p1` 2 GiB vfat `/boot`; `nvme0n1p2` LUKS → `/dev/mapper/root`
   btrfs, subvolume `@` on `/` plus `/home`, `/var/log`, `/var/cache/pacman/pkg`.
-  ~217 GiB used of 952 GiB. Snapper snapshots synced to Limine
+  ~234 GiB used of 952 GiB. Snapper snapshots synced to Limine
   (`limine-snapper-sync`); `snapper list` needs root.
 - Swap: 31 GiB zram (zstd, priority 100) + 31 GiB `/swap/swapfile` (priority 0)
   with `resume=` on the kernel cmdline, so hibernate to the swapfile is
@@ -98,7 +100,7 @@ flags the shipped skill prescribes), `inxi -Fxxxz --no-sudo`, `hyprctl monitors`
   (`btintel_pcie`, `hci0`, adapter name `omarchy-xps13`).
 - Ports: two USB-C / Thunderbolt 4 (USB4) ports (`00:07.0`, `00:07.2`, Intel
   Gen16 controllers via `bolt`). No USB-A, HDMI or Ethernet on the chassis.
-- Battery: Dell `J7H5M58C` 54 Wh Li-polymer, 39 cycles, health ~100 %,
+- Battery: Dell `J7H5M58C` 54 Wh Li-polymer, 47 cycles, health ~100 %,
   adaptive charge window 50–90 %. Two fans (max 6800 / 6500 rpm), readable via
   `dell_smm_hwmon`; `sensors` covers CPU, NVMe, Wi-Fi and chassis temperatures.
 
@@ -111,7 +113,8 @@ flags the shipped skill prescribes), `inxi -Fxxxz --no-sudo`, `hyprctl monitors`
 - Bluetooth pairings include François-Xavier's AirPods, iPad mini 7, Plaud Note
   Pro, Samsung The Frame 55, several Schneider BLE devices and a Hue Signe
   gradient floor lamp. None connected at survey time.
-- Network: Wi-Fi on `FRITZ!Box 7490`, 5 GHz channel 100, 80 MHz, WPA2.
+- Network: Wi-Fi on `FRITZ!Box 7490`, 5 GHz channel 100, 80 MHz, WPA2 at
+  survey; on `Athens`, 5 GHz channel 36, WPA2/WPA3 on 2026-11-21.
   Tailscale up as `omarchy-xps13`; active peers at survey: `home-lab`,
   `macbook-pro-m3-max`, `dev-server`, `hermes-agent`, `nas-luxembourg`.
   `gitlab.test` resolves through the tailnet (split DNS).
@@ -185,8 +188,14 @@ and `stable-mirror.omarchy.org`)
   intel_lpmd, power-profiles-daemon, upower, udisks2, sddm, systemd-resolved,
   systemd-oomd.
 
-**Observed this boot**: the journal shows `sshd` failing to start six times
-early in the boot before it came up (it is active now); nothing else recurring.
+**Observed in the logs** (2026-11-21, first boot on BIOS 1.26.0): `sshd` fails
+its first start at every boot because `ListenAddress` is the tailnet IP and it
+is not assigned yet; `Restart=on-failure` brings it up about 5 s later (six
+failures on 2026-11-08, one on 2026-11-21; omarchy-install issue #2).
+`bluetoothd` logged ~16,500 "Unable to register device interface" errors on
+2026-11-14..16 and has been quiet since. `gkr-pam: couldn't unlock the login
+keyring` at boot is expected with SDDM autologin. `cos-push` occasionally fails
+on a run and succeeds on the next.
 
 **Needs root on this machine (ask first)**: `dmidecode`, `smartctl` /
 `nvme smart-log`, `snapper list`, `fwupdmgr refresh`, the Docker socket,
