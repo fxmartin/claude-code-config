@@ -48,7 +48,8 @@ flags the shipped skill prescribes), `inxi -Fxxxz --no-sudo`, `hyprctl monitors`
 
 **Identity and firmware**
 - Dell XPS 13 9350, board `0MMW13` rev A01, SKU `0CC9`. BIOS 1.26.0
-  (2026-09-21, installed through fwupd on 2026-11-21). UEFI 2.70, Secure Boot off, TPM 2.0 (`/dev/tpm0`), measured UKI.
+  (2026-09-21, installed through fwupd on 2026-11-21). UEFI 2.70, Secure Boot
+  off, TPM 2.0 (`/dev/tpm0`), measured UKI.
 - Omarchy 4.5.0-3 (`omarchy-version`), kernel `linux-omarchy` 7.2.15, systemd 262,
   Hyprland 0.56.2 under uwsm, SDDM display manager, Limine 12.9.4 bootloader.
 - Locale `en_US.UTF-8`, keyboard `fr` (console, X11 and Hyprland, option
